@@ -142,7 +142,9 @@ class TestMenus(unittest.TestCase):
         self.assertEqual(app.api.calls, [])
 
     def test_empty_sections_say_soon(self):
-        app = make_app()
+        c = copy.deepcopy(CONTENT)
+        c["explanations"]["topics"] = []
+        app = make_app(c)
         handle_update(cb("e"), app)
         self.assertIn("قريبًا", app.api.last("editMessageText")["text"])
         handle_update(cb("f"), app)
@@ -191,7 +193,7 @@ class TestExplanations(unittest.TestCase):
         c = copy.deepcopy(CONTENT)
         c["explanations"]["topics"] = [
             {"title": "نص فقط", "text": "الشرح"},
-            {"title": "من القناة", "videos": ["https://t.me/c/123456/7"]},
+            {"title": "من القناة", "posts": ["https://t.me/c/123456/7"]},
             {"title": "عدة ملفات", "text": "شرح", "videos": ["BAACAgQ", "document:XYZ"],
              "buttons": [{"text": "يوتيوب", "url": "https://youtube.com/x"}]},
         ]
