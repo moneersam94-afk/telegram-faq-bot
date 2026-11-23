@@ -5,6 +5,7 @@
 - GET  /setup     إعادة ربط البوت بتلجرام يدويًا (يحدث تلقائيًا عند كل تشغيل).
 
 يحتاج متغيرًا واحدًا فقط: TELEGRAM_BOT_TOKEN.
+ويبقى مستيقظًا بزيارة رابطه كل 10 دقائق (KEEP_AWAKE_MINUTES، و0 للإيقاف).
 """
 
 from __future__ import annotations
@@ -14,7 +15,9 @@ import hmac
 import json
 import os
 import threading
+import time
 import traceback
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from bot.core import TelegramAPI, TelegramError, handle_update, load_faq
@@ -91,13 +94,35 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def log_message(self, fmt, *args):
+        if getattr(self, "headers", None) and self.headers.get("User-Agent") == KEEP_AWAKE_UA:
+            return  # لا نملأ السجل بزيارات الإبقاء مستيقظًا
         print("%s %s" % (self.address_string(), fmt % args), flush=True)
+
+
+KEEP_AWAKE_UA = "keep-awake"
+
+
+def keep_awake(interval: int) -> None:
+    """يزور رابط السيرفر العام كل بضع دقائق حتى لا ينام في خطة Render المجانية
+    (تنام الخدمة بعد 15 دقيقة بدون طلبات قادمة من الخارج)."""
+    url = public_url() + "/"
+    while True:
+        time.sleep(interval)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": KEEP_AWAKE_UA})
+            urllib.request.urlopen(req, timeout=30).read()
+        except Exception as e:
+            print("keep-awake ping failed:", e, flush=True)
 
 
 def main() -> None:
     port = int(os.environ.get("PORT", "10000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=lambda: print(ensure_webhook(), flush=True), daemon=True).start()
+    minutes = float(os.environ.get("KEEP_AWAKE_MINUTES", "10"))
+    if public_url() and minutes > 0:
+        threading.Thread(target=keep_awake, args=(int(minutes * 60),), daemon=True).start()
+        print(f"keep-awake: ping every {minutes:g} min", flush=True)
     print(f"listening on port {port}", flush=True)
     server.serve_forever()
 
