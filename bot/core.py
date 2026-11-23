@@ -1,79 +1,64 @@
-"""منطق البوت: قراءة الأسئلة والأجوبة، البحث فيها، والرد على تحديثات تلجرام.
+"""منطق البوت: القوائم، الشروحات، الأسئلة الشائعة، الإبلاغ عن مشكلة، والرد على تلجرام.
 
-لا يعتمد على أي مكتبة خارجية (مكتبة بايثون القياسية فقط)،
-ويُستخدم من وضع التشغيل المحلي (run_local.py) ومن الـ webhook على Vercel.
+لا يعتمد على أي مكتبة خارجية. كل النصوص في content.json.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import urllib.error
-import urllib.request
+import threading
 from pathlib import Path
 
-FAQ_PATH = Path(__file__).with_name("faq.json")
-API_BASE = "https://api.telegram.org"
+from bot import admin
+from bot.alarm import Alarm
+from bot.storage import Store
+from bot.telegram import TelegramAPI, TelegramError  # noqa: F401  (يُستورد من هنا أيضًا)
+from bot.ui import Ctx, Reply, btn, home_row, kb, url_btn
+
+CONTENT_PATH = Path(__file__).with_name("content.json")
+ALLOWED_UPDATES = ["message", "callback_query", "my_chat_member"]
 
 
-# ---------------------------------------------------------------- Telegram API
+# ------------------------------------------------------------------ content
 
 
-class TelegramError(Exception):
-    pass
-
-
-class TelegramAPI:
-    def __init__(self, token: str, timeout: int = 40):
-        if not token:
-            raise ValueError("TELEGRAM_BOT_TOKEN غير موجود")
-        self._url = f"{API_BASE}/bot{token}/"
-        self.timeout = timeout
-
-    def call(self, method: str, **params):
-        data = json.dumps(params).encode("utf-8")
-        req = urllib.request.Request(
-            self._url + method,
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            try:
-                body = json.loads(e.read().decode("utf-8"))
-            except Exception:
-                raise TelegramError(f"{method}: HTTP {e.code}") from None
-        if not body.get("ok"):
-            raise TelegramError(f"{method}: {body.get('description')}")
-        return body.get("result")
-
-
-# ------------------------------------------------------------------- FAQ data
-
-
-def load_faq(path: Path = FAQ_PATH) -> dict:
+def load_content(path: Path = CONTENT_PATH) -> dict:
     with open(path, encoding="utf-8") as f:
-        faq = json.load(f)
-    for key in ("company_name", "welcome", "fallback", "categories"):
-        if key not in faq:
-            raise ValueError(f"faq.json: الحقل '{key}' مفقود")
-    if not faq["categories"]:
-        raise ValueError("faq.json: لا توجد أقسام")
-    for ci, cat in enumerate(faq["categories"]):
+        c = json.load(f)
+    for key in ("welcome", "prompt", "fallback", "explanations", "faq", "report", "alarm"):
+        if key not in c:
+            raise ValueError(f"content.json: الحقل '{key}' مفقود")
+    for key in ("explanations", "faq", "report"):
+        if not c[key].get("title"):
+            raise ValueError(f"content.json: القسم '{key}' بلا title")
+    for i, t in enumerate(c["explanations"].get("topics") or []):
+        if not t.get("title") or not (t.get("text") or t.get("videos")):
+            raise ValueError(f"content.json: الشرح رقم {i + 1} ينقصه title أو text/videos")
+        for b in t.get("buttons") or []:
+            if not b.get("text") or not b.get("url"):
+                raise ValueError(f"content.json: زر في الشرح '{t['title']}' ينقصه text أو url")
+    for ci, cat in enumerate(c["faq"].get("categories") or []):
         if not cat.get("title") or not cat.get("questions"):
-            raise ValueError(f"faq.json: القسم رقم {ci + 1} بلا عنوان أو بلا أسئلة")
+            raise ValueError(f"content.json: قسم الأسئلة رقم {ci + 1} بلا عنوان أو بلا أسئلة")
         for qi, item in enumerate(cat["questions"]):
             if not item.get("q") or not item.get("a"):
-                raise ValueError(
-                    f"faq.json: السؤال {qi + 1} في قسم '{cat['title']}' ينقصه q أو a"
-                )
-    return faq
+                raise ValueError(f"content.json: السؤال {qi + 1} في '{cat['title']}' ينقصه q أو a")
+    for i, t in enumerate(c["report"].get("types") or []):
+        if not t.get("title"):
+            raise ValueError(f"content.json: نوع المشكلة رقم {i + 1} بلا title")
+    Alarm.validate(c["alarm"])
+    return c
 
 
-def fill(text: str, faq: dict) -> str:
-    return text.replace("{company}", faq["company_name"])
+class App:
+    def __init__(self, api, content: dict, store: Store | None = None, admins=(), run=None):
+        self.api = api
+        self.content = content
+        self.store = store if store is not None else Store()
+        self.admins = {int(a) for a in admins}
+        self.run = run or (lambda fn: threading.Thread(target=fn, daemon=True).start())
+        self.alarm = Alarm(self)
 
 
 # ------------------------------------------------------- Arabic text matching
@@ -112,27 +97,24 @@ def tokens(text: str) -> set[str]:
     return {_stem(w) for w in words if w not in _STOPWORDS and len(w) > 1}
 
 
-def search(faq: dict, text: str, limit: int = 3) -> list[tuple[int, int, int]]:
+def _keyword_hit(kw: str, norm: str, query: set[str]) -> bool:
+    nkw = normalize(kw)
+    if not nkw:
+        return False
+    if " " in nkw:  # عبارة من أكثر من كلمة
+        return f" {nkw} " in norm
+    kw_stem = _stem(nkw)  # كلمة واحدة: تطابق أيضًا مع اللواحق مثل "موقعكم" ← "موقع"
+    return kw_stem in query or (len(kw_stem) >= 3 and any(t.startswith(kw_stem) for t in query))
+
+
+def search(categories: list, text: str, limit: int = 3) -> list[tuple[int, int, int]]:
     """يرجع قائمة (الدرجة، رقم القسم، رقم السؤال) مرتبة من الأقرب."""
     norm = f" {normalize(text)} "
     query = tokens(text)
     results = []
-    for ci, cat in enumerate(faq["categories"]):
+    for ci, cat in enumerate(categories):
         for qi, item in enumerate(cat["questions"]):
-            score = 0
-            for kw in item.get("keywords", []):
-                nkw = normalize(kw)
-                if not nkw:
-                    continue
-                if " " in nkw:  # عبارة من أكثر من كلمة
-                    hit = f" {nkw} " in norm
-                else:  # كلمة واحدة: تطابق أيضًا مع اللواحق مثل "موقعكم" ← "موقع"
-                    kw_stem = _stem(nkw)
-                    hit = kw_stem in query or (
-                        len(kw_stem) >= 3 and any(t.startswith(kw_stem) for t in query)
-                    )
-                if hit:
-                    score += 3
+            score = 3 * sum(_keyword_hit(kw, norm, query) for kw in item.get("keywords", []))
             score += len(query & tokens(item["q"]))
             if score:
                 results.append((score, ci, qi))
@@ -142,145 +124,312 @@ def search(faq: dict, text: str, limit: int = 3) -> list[tuple[int, int, int]]:
 
 MATCH_THRESHOLD = 2
 
-
-# -------------------------------------------------------------- Keyboards
-
-
-def _kb(rows):
-    return {"inline_keyboard": rows}
-
-
-def main_menu(faq: dict):
-    rows = [
-        [{"text": cat["title"], "callback_data": f"c:{ci}"}]
-        for ci, cat in enumerate(faq["categories"])
-    ]
-    if faq.get("human_contact"):
-        rows.append([{"text": "🙋 تواصل مع شخص", "callback_data": "h"}])
-    return _kb(rows)
+# كلمات تفتح القسم المناسب إذا لم يوجد جواب في الأسئلة الشائعة (بالترتيب)
+INTENTS = [
+    ("report", ["مشكله", "مشاكل", "عطل", "خطا", "بلاغ", "ابلاغ", "شكوي", "شكوه"]),
+    ("explain", ["شرح", "اشرح", "فيديو", "تعلم", "علمني"]),
+    ("alarm", ["منبه", "تنبيه", "تذكير", "ذكرني", "صفقه", "صفقات", "ارباح", "موعد"]),
+]
 
 
-def category_menu(faq: dict, ci: int):
-    cat = faq["categories"][ci]
-    rows = [
-        [{"text": item["q"], "callback_data": f"q:{ci}:{qi}"}]
-        for qi, item in enumerate(cat["questions"])
-    ]
-    rows.append([{"text": "⬅️ القائمة الرئيسية", "callback_data": "m"}])
-    return _kb(rows)
+def detect_intent(text: str) -> str | None:
+    norm, query = f" {normalize(text)} ", tokens(text)
+    for name, words in INTENTS:
+        if any(_keyword_hit(w, norm, query) for w in words):
+            return name
+    return None
 
 
-def answer_menu(ci: int):
-    return _kb(
-        [
-            [{"text": "⬅️ رجوع للقسم", "callback_data": f"c:{ci}"}],
-            [{"text": "🏠 القائمة الرئيسية", "callback_data": "m"}],
-        ]
-    )
+# -------------------------------------------------------------------- menus
 
 
-def back_menu():
-    return _kb([[{"text": "🏠 القائمة الرئيسية", "callback_data": "m"}]])
-
-
-# --------------------------------------------------------------- Handlers
-
-
-def welcome_text(faq: dict) -> str:
-    parts = [fill(faq["welcome"], faq)]
-    if faq.get("disclaimer"):
-        parts.append("ℹ️ " + fill(faq["disclaimer"], faq))
-    parts.append("اختر من القائمة، أو اكتب سؤالك مباشرة 👇")
+def welcome_text(c: dict, user: dict | None = None) -> str:
+    name = ((user or {}).get("first_name") or "").strip()
+    w = c["welcome"].replace("{name}", name) if name else \
+        c["welcome"].replace(" {name}", "").replace("{name}", "")
+    parts = [w]
+    if c.get("disclaimer"):
+        parts.append("ℹ️ " + c["disclaimer"])
+    parts.append(c["prompt"])
     return "\n\n".join(parts)
 
 
-def human_text(faq: dict) -> str:
-    return fill(faq["human_contact"], faq)
+def main_menu(app: App, chat_id) -> dict:
+    c = app.content
+    alarm_label = ("⏰ منبه الصفقات اليومية (مفعّل ✅)" if app.alarm.is_on(chat_id)
+                   else c["alarm"].get("button") or c["alarm"]["title"])
+    return kb([[btn(c["explanations"]["title"], "e")],
+               [btn(c["faq"]["title"], "f")],
+               [btn(c["report"]["title"], "r")],
+               [btn(alarm_label, "a")]])
 
 
-def answer_text(faq: dict, ci: int, qi: int) -> str:
-    item = faq["categories"][ci]["questions"][qi]
-    return f"❓ {item['q']}\n\n{fill(item['a'], faq)}"
+def home_reply(ctx: Ctx) -> Reply:
+    return Reply(welcome_text(ctx.app.content, ctx.user), main_menu(ctx.app, ctx.chat_id))
 
 
-def handle_update(update: dict, api: TelegramAPI, faq: dict) -> None:
+def _section_text(sec: dict) -> str:
+    return f"{sec['title']}\n\n{sec.get('intro', '')}".strip()
+
+
+# ----------------------------------------------------------- explanations
+
+MEDIA = {"video": "sendVideo", "photo": "sendPhoto", "document": "sendDocument",
+         "animation": "sendAnimation", "audio": "sendAudio", "voice": "sendVoice"}
+_POST_LINK = re.compile(r"^(?:https?://)?t\.me/(c/)?([A-Za-z0-9_]+)/(\d+)/?$")
+
+
+def media_call(src: str) -> tuple[str, dict]:
+    """رابط منشور في قناة ← نسخه (بدون "محوّل من")، أو معرف ملف ← إرساله مباشرة."""
+    src = src.strip()
+    m = _POST_LINK.match(src)
+    if m:
+        chat = int("-100" + m.group(2)) if m.group(1) else "@" + m.group(2)
+        return "copyMessage", {"from_chat_id": chat, "message_id": int(m.group(3))}
+    kind, sep, file_id = src.partition(":")
+    if sep and kind in MEDIA:
+        return MEDIA[kind], {kind: file_id}
+    return "sendVideo", {"video": src}
+
+
+def explain_menu(c: dict) -> Reply:
+    ex = c["explanations"]
+    topics = ex.get("topics") or []
+    if not topics:
+        return Reply(ex.get("empty") or f"{ex['title']}\n\nقريبًا ⏳", kb([home_row()]))
+    rows = [[btn(t["title"], f"e:{i}")] for i, t in enumerate(topics)]
+    return Reply(_section_text(ex), kb(rows + [home_row()]))
+
+
+def topic_markup(t: dict) -> dict:
+    rows = [[url_btn(b["text"], b["url"])] for b in t.get("buttons") or []]
+    rows.append([btn("⬅️ الشروحات", "e"), btn("🏠 الرئيسية", "m")])
+    return kb(rows)
+
+
+def show_topic(ctx: Ctx, i: int) -> Reply:
+    t = ctx.app.content["explanations"]["topics"][i]
+    text = f"{t['title']}\n\n{t.get('text', '')}".strip()
+    markup = topic_markup(t)
+    videos = t.get("videos") or []
+    if not videos:
+        return Reply(text, markup)
+
+    single = len(videos) == 1 and len(text) <= 1024  # حد وصف الفيديو في تلجرام
+    if not single:
+        ctx.send(text)
+    for n, src in enumerate(videos):
+        last = n == len(videos) - 1
+        method, params = media_call(src)
+        # منشور القناة بلا نص في الشرح: نترك وصفه الأصلي كما هو
+        if single and (t.get("text") or method != "copyMessage"):
+            params["caption"] = text
+        if last:
+            params["reply_markup"] = markup
+        try:
+            ctx.api.call(method, chat_id=ctx.chat_id, **params)
+        except TelegramError as e:
+            print(f"explain media failed ({src}): {e}", flush=True)
+            if last:
+                ctx.send((text + "\n\n" if single else "") + "⚠️ تعذّر عرض الفيديو حاليًا.", markup)
+    return Reply(toast="🎬 تفضّل الشرح")
+
+
+# --------------------------------------------------------------------- FAQ
+
+
+def faq_menu(c: dict) -> Reply:
+    faq = c["faq"]
+    cats = faq.get("categories") or []
+    if not cats:
+        return Reply(faq.get("empty") or f"{faq['title']}\n\nقريبًا ⏳", kb([home_row()]))
+    rows = [[btn(cat["title"], f"c:{ci}")] for ci, cat in enumerate(cats)]
+    return Reply(_section_text(faq), kb(rows + [home_row()]))
+
+
+def category_reply(c: dict, ci: int) -> Reply:
+    cat = c["faq"]["categories"][ci]
+    rows = [[btn(item["q"], f"q:{ci}:{qi}")] for qi, item in enumerate(cat["questions"])]
+    rows.append([btn("⬅️ الأقسام", "f"), btn("🏠 الرئيسية", "m")])
+    return Reply(f"📂 {cat['title']}\n\nاختر سؤالك:", kb(rows))
+
+
+def answer_reply(c: dict, ci: int, qi: int) -> Reply:
+    item = c["faq"]["categories"][ci]["questions"][qi]
+    return Reply(f"❓ {item['q']}\n\n{item['a']}",
+                 kb([[btn("⬅️ رجوع للقسم", f"c:{ci}")], home_row()]))
+
+
+# ------------------------------------------------------------------ report
+
+
+def contact_url(contact: str) -> str | None:
+    contact = contact.strip()
+    if re.fullmatch(r"@[A-Za-z0-9_]{4,32}", contact):
+        return "https://t.me/" + contact[1:]
+    if re.match(r"^(https?://)?t\.me/\S+$", contact):
+        return contact if contact.startswith("http") else "https://" + contact
+    return None
+
+
+def report_menu(c: dict) -> Reply:
+    r = c["report"]
+    rows = [[btn(t["title"], f"r:{i}")] for i, t in enumerate(r.get("types") or [])]
+    return Reply(_section_text(r), kb(rows + [home_row()]))
+
+
+def report_type(c: dict, i: int) -> Reply:
+    r = c["report"]
+    t = r["types"][i]
+    contact = (t.get("contact") or "").strip()
+    url = contact_url(contact) if contact else None
+    lines = [t["title"], ""]
+    if url:
+        lines += [f"👤 المختص: {contact}", "اضغط الزر بالأسفل لمراسلته مباشرة 👇"]
+    elif contact:
+        lines += [f"👤 للتواصل: {contact}"]
+    else:
+        lines += [r.get("no_contact") or "⏳ سيتم إضافة وسيلة التواصل لهذا النوع قريبًا."]
+    hints = t.get("hints") or r.get("hints") or []
+    if hints:
+        lines += ["", r.get("hints_title") or "📝 حتى تُحل مشكلتك أسرع، أرسل له:"]
+        lines += [f"• {h}" for h in hints]
+    rows = [[url_btn("💬 مراسلة المختص", url)]] if url else []
+    rows.append([btn("⬅️ أنواع المشاكل", "r"), btn("🏠 الرئيسية", "m")])
+    return Reply("\n".join(lines), kb(rows))
+
+
+# ---------------------------------------------------------------- handlers
+
+
+def handle_update(update: dict, app: App) -> None:
     if "callback_query" in update:
-        _handle_callback(update["callback_query"], api, faq)
-        return
+        _on_callback(update["callback_query"], app)
+    elif "my_chat_member" in update:
+        _on_member(update["my_chat_member"], app)
+    elif (update.get("message") or {}).get("chat", {}).get("type") == "private":
+        _on_message(update["message"], app)  # يرد فقط في المحادثات الخاصة
 
-    msg = update.get("message")
-    if not msg or msg.get("chat", {}).get("type") != "private":
-        return  # يرد فقط في المحادثات الخاصة
-    chat_id = msg["chat"]["id"]
+
+def _on_message(msg: dict, app: App) -> None:
+    ctx = Ctx(app, msg["chat"]["id"], msg.get("from"))
+    app.store.touch_user(ctx.chat_id)
+    if ctx.is_admin and admin.on_media(ctx, msg):
+        return
     text = (msg.get("text") or "").strip()
-
     if not text:
-        api.call("sendMessage", chat_id=chat_id,
-                 text="أستقبل الرسائل النصية فقط حاليًا. اكتب سؤالك أو اختر من القائمة.",
-                 reply_markup=main_menu(faq))
+        ctx.send("أستقبل الرسائل النصية فقط حاليًا. اختر من القائمة أو اكتب سؤالك 👇",
+                 main_menu(app, ctx.chat_id))
         return
-
-    command = text.split()[0].split("@")[0].lower() if text.startswith("/") else None
-    if command in ("/start", "/menu", "/help"):
-        api.call("sendMessage", chat_id=chat_id, text=welcome_text(faq),
-                 reply_markup=main_menu(faq))
-        return
-    if command == "/contact" and faq.get("human_contact"):
-        api.call("sendMessage", chat_id=chat_id, text=human_text(faq),
-                 reply_markup=back_menu())
-        return
-
-    matches = [m for m in search(faq, text) if m[0] >= MATCH_THRESHOLD]
-    if not matches:
-        api.call("sendMessage", chat_id=chat_id, text=fill(faq["fallback"], faq),
-                 reply_markup=main_menu(faq))
-        return
-
-    best_score, ci, qi = matches[0]
-    others = [m for m in matches[1:] if m[0] >= best_score - 1 and m[1:] != (ci, qi)]
-    rows = [[{"text": "🔎 " + faq["categories"][c]["questions"][q]["q"],
-              "callback_data": f"q:{c}:{q}"}] for _, c, q in others]
-    rows.append([{"text": "🏠 القائمة الرئيسية", "callback_data": "m"}])
-    text_out = answer_text(faq, ci, qi)
-    if others:
-        text_out += "\n\nقد يهمك أيضًا:"
-    api.call("sendMessage", chat_id=chat_id, text=text_out, reply_markup=_kb(rows))
+    if text.startswith("/"):
+        cmd, _, arg = text.partition(" ")
+        reply = _command(ctx, cmd.split("@")[0].lower(), arg.strip(), msg)
+    else:
+        reply = _answer_text(ctx, text)
+    if reply:
+        ctx.send(reply.text, reply.markup)
 
 
-def _handle_callback(cq: dict, api: TelegramAPI, faq: dict) -> None:
-    data = cq.get("data", "")
-    message = cq.get("message")
+def _command(ctx: Ctx, cmd: str, arg: str, msg: dict):
+    c = ctx.app.content
+    if cmd == "/start" and arg:  # روابط مباشرة مثل t.me/البوت?start=alarm
+        cmd = "/" + arg.lower()
+    if cmd == "/alarm":
+        return ctx.app.alarm.panel(ctx.chat_id)
+    if cmd == "/faq":
+        return faq_menu(c)
+    if cmd == "/report":
+        return report_menu(c)
+    if cmd in ("/explain", "/learn"):
+        return explain_menu(c)
+    if cmd == "/myid":
+        return Reply(f"🆔 معرّفك في تلجرام: {ctx.user.get('id')}")
+    if ctx.is_admin:
+        result = admin.on_command(ctx, cmd, arg, msg)
+        if result is not False:
+            return result
+    return home_reply(ctx)
+
+
+def _answer_text(ctx: Ctx, text: str) -> Reply:
+    c = ctx.app.content
+    cats = c["faq"].get("categories") or []
+    matches = [m for m in search(cats, text) if m[0] >= MATCH_THRESHOLD]
+    if matches:
+        best_score, ci, qi = matches[0]
+        others = [m for m in matches[1:] if m[0] >= best_score - 1 and m[1:] != (ci, qi)]
+        rows = [[btn("🔎 " + cats[oc]["questions"][oq]["q"], f"q:{oc}:{oq}")]
+                for _, oc, oq in others]
+        item = cats[ci]["questions"][qi]
+        out = f"❓ {item['q']}\n\n{item['a']}" + ("\n\nقد يهمك أيضًا:" if others else "")
+        return Reply(out, kb(rows + [home_row()]))
+    intent = detect_intent(text)
+    if intent == "report":
+        return report_menu(c)
+    if intent == "explain":
+        return explain_menu(c)
+    if intent == "alarm":
+        return ctx.app.alarm.panel(ctx.chat_id)
+    return Reply(c["fallback"], main_menu(ctx.app, ctx.chat_id))
+
+
+def _route(ctx: Ctx, data: str) -> Reply:
+    c = ctx.app.content
+    parts = data.split(":")
+    head = parts[0]
+    if data == "m":
+        return home_reply(ctx)
+    if data == "e":
+        return explain_menu(c)
+    if head == "e":
+        return show_topic(ctx, int(parts[1]))
+    if data == "f":
+        return faq_menu(c)
+    if head == "c":
+        return category_reply(c, int(parts[1]))
+    if head == "q":
+        return answer_reply(c, int(parts[1]), int(parts[2]))
+    if data in ("r", "h"):
+        return report_menu(c)
+    if head == "r":
+        return report_type(c, int(parts[1]))
+    if head == "a":
+        return ctx.app.alarm.on_callback(ctx, parts)
+    if head == "ad":
+        return admin.on_callback(ctx, parts)
+    raise ValueError(data)
+
+
+def _on_callback(cq: dict, app: App) -> None:
+    msg = cq.get("message") or {}
+    chat = msg.get("chat") or {}
+    reply = Reply()
+    if chat.get("type") == "private":
+        ctx = Ctx(app, chat["id"], cq.get("from"), msg)
+        try:
+            reply = _route(ctx, cq.get("data") or "")
+        except (ValueError, IndexError, KeyError, TypeError):
+            reply = Reply("هذا الزر لم يعد متاحًا. هذه القائمة المحدّثة 👇",
+                          main_menu(app, ctx.chat_id))
+    params = {"callback_query_id": cq["id"]}
+    if reply.toast:
+        params.update(text=reply.toast, show_alert=reply.alert)
     try:
-        api.call("answerCallbackQuery", callback_query_id=cq["id"])
+        app.api.call("answerCallbackQuery", **params)
     except TelegramError:
         pass
-    if not message:
-        return
+    if chat.get("type") == "private" and reply.text is not None:
+        ctx.show(reply.text, reply.markup)
 
-    text, markup = None, None
-    parts = data.split(":")
-    try:
-        if data == "m":
-            text, markup = welcome_text(faq), main_menu(faq)
-        elif data == "h" and faq.get("human_contact"):
-            text, markup = human_text(faq), back_menu()
-        elif parts[0] == "c" and len(parts) == 2:
-            ci = int(parts[1])
-            cat = faq["categories"][ci]
-            text, markup = f"📂 {cat['title']}\n\nاختر سؤالك:", category_menu(faq, ci)
-        elif parts[0] == "q" and len(parts) == 3:
-            ci, qi = int(parts[1]), int(parts[2])
-            text, markup = answer_text(faq, ci, qi), answer_menu(ci)
-    except (ValueError, IndexError):
-        text = None  # زر قديم بعد تعديل faq.json
 
-    if text is None:
-        text, markup = "هذا الزر لم يعد متاحًا. هذه القائمة المحدّثة:", main_menu(faq)
-
-    try:
-        api.call("editMessageText", chat_id=message["chat"]["id"],
-                 message_id=message["message_id"], text=text, reply_markup=markup)
-    except TelegramError as e:
-        if "not modified" not in str(e):
-            api.call("sendMessage", chat_id=message["chat"]["id"], text=text,
-                     reply_markup=markup)
+def _on_member(upd: dict, app: App) -> None:
+    """عند إضافة البوت مشرفًا في قناة، يكتب فيها معرّفها (مفيد لقناة الفيديوهات)."""
+    chat = upd.get("chat") or {}
+    status = (upd.get("new_chat_member") or {}).get("status")
+    if chat.get("type") == "channel" and status == "administrator":
+        try:
+            app.api.call("sendMessage", chat_id=chat["id"],
+                         text=f"✅ تم ربط البوت بهذه القناة.\n🆔 معرف القناة: {chat['id']}\n\n"
+                              "يمكنك حذف هذه الرسالة.")
+        except TelegramError:
+            pass
