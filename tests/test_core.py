@@ -249,8 +249,8 @@ class TestAlarmSettings(unittest.TestCase):
         self.assertEqual((self.sub()["on"], self.sub()["tz"]), (True, "Asia/Riyadh"))
         self.assertIn("تفعيل", self.app.api.last("answerCallbackQuery")["text"])
         panel = self.app.api.last("editMessageText")["text"]
-        self.assertIn("6:30 ص بتوقيتك", panel)  # 3:30 GMT = 6:30 السعودية
-        self.assertIn("9:30 ص بتوقيتك", panel)
+        self.assertIn("6:30 م بتوقيتك", panel)  # 15:30 GMT = 6:30 م السعودية
+        self.assertIn("9:30 م بتوقيتك", panel)
         handle_update(msg("/start"), self.app)
         self.assertIn("مفعّل", buttons(self.app.api.last("sendMessage")["reply_markup"])[3]["text"])
 
@@ -267,7 +267,7 @@ class TestAlarmSettings(unittest.TestCase):
         self.assertEqual(self.sub()["lead"], 30)
         handle_update(cb("a:of:-300:0"), self.app)
         self.assertEqual(self.sub()["tz"], "-300")
-        self.assertIn("10:30 م بتوقيتك", self.app.api.last("editMessageText")["text"])
+        self.assertIn("10:30 ص بتوقيتك", self.app.api.last("editMessageText")["text"])
         handle_update(cb("a:ps:1"), self.app)
         self.assertGreater(self.sub()["pause"], datetime.now(UTC).timestamp())
         self.assertIn("متوقف مؤقتًا", self.app.api.last("editMessageText")["text"])
@@ -288,7 +288,7 @@ class TestAlarmSettings(unittest.TestCase):
 
 
 class TestScheduler(unittest.TestCase):
-    T0 = datetime(2026, 11, 24, 3, 30, tzinfo=UTC)  # يوم ثلاثاء
+    T0 = datetime(2026, 11, 24, 15, 30, tzinfo=UTC)  # يوم ثلاثاء
 
     def setUp(self):
         self.app = make_app()
@@ -305,7 +305,7 @@ class TestScheduler(unittest.TestCase):
         texts = self.texts()
         self.assertEqual(len(texts), 1)
         self.assertIn("بعد 10 دقائق", texts[0][1])
-        self.assertIn("6:30 ص بتوقيتك", texts[0][1])
+        self.assertIn("6:30 م بتوقيتك", texts[0][1])
 
         self.alarm.tick(self.T0)
         self.alarm.tick(self.T0 + timedelta(seconds=20))
@@ -325,7 +325,7 @@ class TestScheduler(unittest.TestCase):
         app2 = make_app()
         app2.store.set_sub(42, {"on": True, "ev": ["trade"], "lead": 0, "tz": None})
         app2.alarm.days = {0, 1, 2, 3, 4}  # من الاثنين إلى الجمعة
-        app2.alarm.tick(datetime(2026, 11, 28, 3, 30, tzinfo=UTC))  # سبت
+        app2.alarm.tick(datetime(2026, 11, 28, 15, 30, tzinfo=UTC))  # سبت
         self.assertFalse(app2.api.of("sendMessage"))
 
     def test_late_server_does_not_send_stale_alerts(self):
