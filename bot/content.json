@@ -8,7 +8,32 @@
     "title": "📚 شرح عن موضوع معين",
     "intro": "اختر الموضوع الذي تريد شرحه 👇",
     "empty": "📚 الشروحات قيد التجهيز وستُضاف قريبًا ⏳",
-    "topics": []
+    "topics": [
+      {
+        "title": "🏢 ما هي شركة Wealth Excel؟",
+        "posts": ["https://t.me/googlewealthexcel/10"]
+      },
+      {
+        "title": "🖥 شرح الواجهة والدخول للمنصة",
+        "posts": ["https://t.me/googlewealthexcel/21"]
+      },
+      {
+        "title": "💳 شرح طريقة الإيداع",
+        "posts": ["https://t.me/googlewealthexcel/22"]
+      },
+      {
+        "title": "📈 شرح تنفيذ الصفقة اليومية",
+        "posts": ["https://t.me/googlewealthexcel/23"]
+      },
+      {
+        "title": "🎁 شرح نظام الهبة",
+        "posts": ["https://t.me/googlewealthexcel/25"]
+      },
+      {
+        "title": "🤝 شرح نظام الدعم (السلفة)",
+        "posts": ["https://t.me/googlewealthexcel/45"]
+      }
+    ]
   },
 
   "faq": {

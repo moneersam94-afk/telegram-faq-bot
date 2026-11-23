@@ -33,8 +33,8 @@ def load_content(path: Path = CONTENT_PATH) -> dict:
         if not c[key].get("title"):
             raise ValueError(f"content.json: القسم '{key}' بلا title")
     for i, t in enumerate(c["explanations"].get("topics") or []):
-        if not t.get("title") or not (t.get("text") or t.get("videos")):
-            raise ValueError(f"content.json: الشرح رقم {i + 1} ينقصه title أو text/videos")
+        if not t.get("title") or not (t.get("text") or topic_posts(t)):
+            raise ValueError(f"content.json: الشرح رقم {i + 1} ينقصه title أو text/posts")
         for b in t.get("buttons") or []:
             if not b.get("text") or not b.get("url"):
                 raise ValueError(f"content.json: زر في الشرح '{t['title']}' ينقصه text أو url")
@@ -192,6 +192,11 @@ def media_call(src: str) -> tuple[str, dict]:
     return "sendVideo", {"video": src}
 
 
+def topic_posts(t: dict) -> list:
+    """روابط منشورات القناة أو معرفات الملفات ("posts"، والاسم القديم "videos")."""
+    return list(t.get("posts") or []) + list(t.get("videos") or [])
+
+
 def explain_menu(c: dict) -> Reply:
     ex = c["explanations"]
     topics = ex.get("topics") or []
@@ -211,7 +216,7 @@ def show_topic(ctx: Ctx, i: int) -> Reply:
     t = ctx.app.content["explanations"]["topics"][i]
     text = f"{t['title']}\n\n{t.get('text', '')}".strip()
     markup = topic_markup(t)
-    videos = t.get("videos") or []
+    videos = topic_posts(t)
     if not videos:
         return Reply(text, markup)
 
