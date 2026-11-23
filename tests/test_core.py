@@ -249,8 +249,8 @@ class TestAlarmSettings(unittest.TestCase):
         self.assertEqual((self.sub()["on"], self.sub()["tz"]), (True, "Asia/Riyadh"))
         self.assertIn("تفعيل", self.app.api.last("answerCallbackQuery")["text"])
         panel = self.app.api.last("editMessageText")["text"]
-        self.assertIn("6:30 م بتوقيتك", panel)  # 15:30 GMT = 6:30 م السعودية
-        self.assertIn("9:30 م بتوقيتك", panel)
+        self.assertIn("6:30 م – 8:30 م بتوقيتك", panel)  # 15:30 GMT = 6:30 م السعودية، لساعتين
+        self.assertIn("9:30 م – 11:30 م بتوقيتك", panel)
         handle_update(msg("/start"), self.app)
         self.assertIn("مفعّل", buttons(self.app.api.last("sendMessage")["reply_markup"])[3]["text"])
 
@@ -267,7 +267,7 @@ class TestAlarmSettings(unittest.TestCase):
         self.assertEqual(self.sub()["lead"], 30)
         handle_update(cb("a:of:-300:0"), self.app)
         self.assertEqual(self.sub()["tz"], "-300")
-        self.assertIn("10:30 ص بتوقيتك", self.app.api.last("editMessageText")["text"])
+        self.assertIn("10:30 ص – 12:30 م بتوقيتك", self.app.api.last("editMessageText")["text"])
         handle_update(cb("a:ps:1"), self.app)
         self.assertGreater(self.sub()["pause"], datetime.now(UTC).timestamp())
         self.assertIn("متوقف مؤقتًا", self.app.api.last("editMessageText")["text"])
@@ -304,14 +304,14 @@ class TestScheduler(unittest.TestCase):
         self.alarm.tick(self.T0 - timedelta(minutes=9, seconds=50))
         texts = self.texts()
         self.assertEqual(len(texts), 1)
-        self.assertIn("بعد 10 دقائق", texts[0][1])
-        self.assertIn("6:30 م بتوقيتك", texts[0][1])
+        self.assertIn("يبدأ بعد 10 دقائق", texts[0][1])
+        self.assertIn("6:30 م – 8:30 م بتوقيتك", texts[0][1])
 
         self.alarm.tick(self.T0)
         self.alarm.tick(self.T0 + timedelta(seconds=20))
         self.assertEqual(len(self.texts()), 2)
         main = self.app.api.last("sendMessage")
-        self.assertIn("حان الآن موعد الصفقة", main["text"])
+        self.assertIn("موعد الصفقة متاح الآن", main["text"])
         self.assertIn("a:ok", json.dumps(main["reply_markup"]))
 
     def test_skips_paused_off_and_other_days(self):
@@ -328,9 +328,24 @@ class TestScheduler(unittest.TestCase):
         app2.alarm.tick(datetime(2026, 11, 28, 15, 30, tzinfo=UTC))  # سبت
         self.assertFalse(app2.api.of("sendMessage"))
 
-    def test_late_server_does_not_send_stale_alerts(self):
+    def test_late_server_still_alerts_while_window_open(self):
         self.alarm.tick(self.T0 + timedelta(minutes=11))
-        self.assertFalse(self.texts())
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn("يُغلق بعد ساعة و49 دقيقة", self.texts()[0][1])
+
+        app2 = make_app()
+        app2.store.set_sub(42, {"on": True, "ev": ["trade"], "lead": 0, "tz": None})
+        app2.alarm.tick(self.T0 + timedelta(minutes=120))  # أُغلق الموعد
+        self.assertFalse(app2.api.of("sendMessage"))
+
+    def test_closing_reminder_skips_who_pressed_done(self):
+        self.app.store.set_sub(46, {"on": True, "ev": ["trade"], "lead": 0, "tz": None})
+        handle_update(cb("a:ok:0:20261124", uid=46, text="🔔"), self.app)
+        self.alarm.tick(self.T0 + timedelta(minutes=105))  # قبل الإغلاق بربع ساعة
+        closing = [(c, x) for c, x in self.texts() if "تنبيه أخير" in x]
+        self.assertEqual([c for c, _ in closing], [42])
+        self.assertIn("يُغلق بعد 15 دقيقة", closing[0][1])
+        self.assertIn("8:30 م", closing[0][1])
 
     def test_blocked_user_is_unsubscribed(self):
         def blocked(p):
@@ -340,10 +355,19 @@ class TestScheduler(unittest.TestCase):
         self.assertFalse(self.app.store.get_sub(42)["on"])
 
     def test_snooze(self):
-        handle_update(cb("a:sz:0", text="🔔 حان الآن موعد الصفقة"), self.app)
+        self.alarm._now = lambda: self.T0 + timedelta(minutes=10)
+        handle_update(cb("a:sz:0", text="🔔 موعد الصفقة متاح الآن"), self.app)
         self.assertIn("سأذكّرك", self.app.api.last("editMessageText")["text"])
-        self.alarm.tick(datetime.now(UTC) + timedelta(minutes=6))
+        self.alarm.tick(self.T0 + timedelta(minutes=16))
         self.assertIn("تذكير: 📈 موعد الصفقة", self.app.api.last("sendMessage")["text"])
+
+    def test_snooze_refused_when_window_closing_or_closed(self):
+        self.alarm._now = lambda: self.T0 + timedelta(minutes=117)
+        handle_update(cb("a:sz:0"), self.app)
+        self.assertIn("يُغلق قبل ذلك", self.app.api.last("answerCallbackQuery")["text"])
+        self.alarm._now = lambda: self.T0 + timedelta(minutes=130)
+        handle_update(cb("a:sz:0"), self.app)
+        self.assertIn("انتهى وقت", self.app.api.last("answerCallbackQuery")["text"])
 
 
 class TestStorage(unittest.TestCase):
