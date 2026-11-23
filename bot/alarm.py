@@ -137,12 +137,15 @@ class Alarm:
         self.events = []
         for ev in cfg["events"]:
             h, m = (int(x) for x in ev["time_gmt"].split(":"))
-            self.events.append({**ev, "h": h, "m": m})
+            self.events.append({**ev, "h": h, "m": m,
+                                "dur": timedelta(minutes=int(ev.get("duration_minutes") or 0))})
+        self.closing = int(cfg.get("closing_reminder_minutes") or 0)
         self.days = {DAY_KEYS.index(d) for d in (cfg.get("days") or DAY_KEYS)}
         self.lead_options = [int(n) for n in (cfg.get("lead_options") or [0, 5, 10, 15, 30, 60])]
         self.default_lead = int(cfg.get("default_lead_minutes", 10))
         self.snooze_minutes = int(cfg.get("snooze_minutes", 5))
-        self._snoozes: list[tuple[datetime, int, int]] = []
+        self._snoozes: list = []
+        self._now = lambda: datetime.now(UTC)  # يُستبدل في الاختبارات
         self._lock = threading.Lock()
 
     @staticmethod
@@ -164,6 +167,10 @@ class Alarm:
             if ev["id"] in seen:
                 raise ValueError(f"content.json: المعرف '{ev['id']}' مكرر في المنبه")
             seen.add(ev["id"])
+            dur = ev.get("duration_minutes") or 0
+            if not isinstance(dur, int) or not 0 <= dur < 1440:
+                raise ValueError(f"content.json: duration_minutes للموعد '{ev['id']}' "
+                                 "يجب أن يكون عدد دقائق أقل من 1440")
         for d in cfg.get("days") or []:
             if d not in DAY_KEYS:
                 raise ValueError(f"content.json: اليوم '{d}' غير معروف. المتاح: {DAY_KEYS}")
@@ -215,12 +222,31 @@ class Alarm:
                     break
         return best
 
-    def _when(self, sub: dict | None, t: datetime) -> str:
+    def open_window(self, ev, now: datetime):
+        """بداية الموعد إذا كان متاحًا الآن، وإلا None."""
+        for t in self._occurrences(ev, now, before=1, after=0):
+            if t <= now < t + ev["dur"]:
+                return t
+        return None
+
+    def _when(self, sub: dict | None, t: datetime, end: datetime | None = None) -> str:
+        """وقت (أو فترة من - إلى) بتوقيت المشترك وبتوقيت غرينتش."""
         tz = (sub or {}).get("tz")
         local = t.astimezone(tz_of(tz))
+
+        def fmt(a, b):
+            return f"{clock(a)} – {clock(b)}" if b else clock(a)
+
         if not tz or local.utcoffset() == timedelta(0):
-            return f"{clock(t)} بتوقيت غرينتش"
-        return f"{clock(local)} بتوقيتك ({clock(t)} GMT)"
+            return f"{fmt(t, end)} بتوقيت غرينتش"
+        local_end = end.astimezone(tz_of(tz)) if end else None
+        return f"{fmt(local, local_end)} بتوقيتك ({fmt(t, end)} GMT)"
+
+    def _span(self, sub, ev, start: datetime) -> str:
+        return self._when(sub, start, start + ev["dur"] if ev["dur"] else None)
+
+    def _end_clock(self, sub, ev, start) -> str:
+        return clock((start + ev["dur"]).astimezone(tz_of((sub or {}).get("tz"))))
 
     def days_label(self) -> str:
         if len(self.days) == 7:
@@ -233,23 +259,47 @@ class Alarm:
 
     # ---------------------------------------------------------------- texts
 
-    def main_text(self, sub, ev, target) -> str:
-        return (f"🔔 {ev.get('emoji', '')} حان الآن {ev['name']}!\n\n"
-                f"🕒 الساعة {self._when(sub, target)}\n\n{ev.get('message', '')}").strip()
+    def _closes_line(self, sub, ev, start, now) -> str:
+        if not ev["dur"]:
+            return ""
+        return (f"\n⌛ متاح حتى الساعة {self._end_clock(sub, ev, start)} "
+                f"(يُغلق {until_label(start + ev['dur'] - now)})")
 
-    def pre_text(self, sub, ev, target, now) -> str:
-        return (f"⏰ تذكير مسبق\n\n{ev.get('emoji', '')} {ev['name']} {until_label(target - now)}\n"
-                f"🕒 الساعة {self._when(sub, target)}\n\n{ev.get('pre_message', '')}").strip()
+    def main_text(self, sub, ev, start, now=None) -> str:
+        now = now or start
+        head = (f"🔔 {ev.get('emoji', '')} {ev['name']} متاح الآن!" if ev["dur"]
+                else f"🔔 {ev.get('emoji', '')} حان الآن {ev['name']}!")
+        return (f"{head}\n\n🕒 {self._span(sub, ev, start)}{self._closes_line(sub, ev, start, now)}"
+                f"\n\n{ev.get('message', '')}").strip()
 
-    def snooze_text(self, sub, ev) -> str:
+    def pre_text(self, sub, ev, start, now) -> str:
+        name = f"{ev['name']} يبدأ" if ev["dur"] else ev["name"]
+        return (f"⏰ تذكير مسبق\n\n{ev.get('emoji', '')} {name} {until_label(start - now)}\n"
+                f"🕒 {self._span(sub, ev, start)}\n\n{ev.get('pre_message', '')}").strip()
+
+    def closing_text(self, sub, ev, start, now) -> str:
+        return (f"⏳ تنبيه أخير: {ev.get('emoji', '')} {ev['name']} يُغلق "
+                f"{until_label(start + ev['dur'] - now)}\n"
+                f"🕒 الإغلاق الساعة {self._end_clock(sub, ev, start)}\n\n"
+                "إذا ما أنجزته بعد، هذا وقتك! ⏰")
+
+    def snooze_text(self, sub, ev, start, now) -> str:
         return (f"🔔 تذكير: {ev.get('emoji', '')} {ev['name']}\n\n"
-                f"طلبت مني أذكّرك مرة ثانية، لا تنسَ! ⏰\n\n{ev.get('message', '')}").strip()
+                f"طلبت مني أذكّرك مرة ثانية، لا تنسَ! ⏰{self._closes_line(sub, ev, start, now)}\n\n"
+                f"{ev.get('message', '')}").strip()
 
-    def alert_buttons(self, ei: int, snooze: bool = True) -> dict:
-        row = [btn("✅ تمّ", "a:ok")]
+    def alert_buttons(self, ei: int, start: datetime | None, snooze: bool = True,
+                      test: bool = False) -> dict:
+        day = f"{start:%Y%m%d}" if start else "0"
+        row = [btn("✅ تمّ", f"a:ok:{ei}:{day}")]
         if snooze:
-            row.append(btn(f"😴 ذكّرني بعد {minutes_label(self.snooze_minutes)}", f"a:sz:{ei}"))
+            row.append(btn(f"😴 ذكّرني بعد {minutes_label(self.snooze_minutes)}",
+                           f"a:sz:{ei}" + (":t" if test else "")))
         return kb([row])
+
+    @staticmethod
+    def _ack_key(day: str, ev_id: str, chat_id) -> str:
+        return f"ack|{day}|{ev_id}|{chat_id}"
 
     # ---------------------------------------------------------------- panel
 
@@ -262,9 +312,13 @@ class Alarm:
             lines = [title, "", "فعّل المنبه وسأذكّرك تلقائيًا بـ:"]
             for ev in self.events:
                 lines.append(f"{ev.get('emoji', '🔔')} {ev['name']}: "
-                             f"{self._when(sub, self._at(ev, now.date()))}")
+                             f"{self._span(sub, ev, self._at(ev, now.date()))}")
             lines += ["", "✨ مزايا المنبه:",
-                      "• تنبيه عند الموعد بالضبط، وتذكير مسبق قبله بالمدة التي تختارها",
+                      "• تنبيه عند فتح الموعد بالضبط، وتذكير مسبق قبله بالمدة التي تختارها"]
+            if self.closing:
+                lines.append(f"• تنبيه أخير قبل الإغلاق بـ{minutes_label(self.closing)} "
+                             "إذا لم تضغط «تمّ»")
+            lines += [
                       "• المواعيد تظهر بتوقيت بلدك، والتوقيت الصيفي محسوب تلقائيًا",
                       "• تختار ما يناسبك: الصفقة، أو الأرباح، أو الاثنين",
                       f"• زر «ذكّرني بعد {minutes_label(self.snooze_minutes)}» إذا كنت مشغولًا",
@@ -285,13 +339,21 @@ class Alarm:
         for ev in self.events:
             mark = "✅" if ev["id"] in sub.get("ev", []) else "🔕"
             lines.append(f"{ev.get('emoji', '🔔')} {ev['name']}: "
-                         f"{self._when(sub, self._at(ev, now.date()))} {mark}")
+                         f"{self._span(sub, ev, self._at(ev, now.date()))} {mark}")
         lead = int(sub.get("lead") or 0)
         lines.append(f"⏳ التذكير المسبق: {'قبل ' + minutes_label(lead) if lead else 'بدون'}")
         lines.append(f"📅 الأيام: {self.days_label()}")
+        live = [(ev, s) for ev in self.events if ev["id"] in sub.get("ev", [])
+                for s in [self.open_window(ev, now)] if s]
+        if live:
+            lines.append("")
+            for ev, s in live:
+                lines.append(f"🟢 {ev['name']} متاح الآن، يُغلق {until_label(s + ev['dur'] - now)}")
         nxt = self.next_alert(sub, now)
         if nxt:
-            lines += ["", f"⏱ التنبيه القادم: {nxt[0]['name']} {until_label(nxt[1] - now)}"]
+            if not live:
+                lines.append("")
+            lines.append(f"⏱ التنبيه القادم: {nxt[0]['name']} {until_label(nxt[1] - now)}")
 
         ev_buttons = [btn(f"{ev.get('emoji', '')} {ev.get('button', ev['name'])} "
                           f"{'✅' if ev['id'] in sub.get('ev', []) else '❌'}", f"a:ev:{i}")
@@ -345,7 +407,7 @@ class Alarm:
         flag = len(parts) > 3 and parts[3] == "1"
         cid = ctx.chat_id
         sub = self.app.store.get_sub(cid)
-        now = datetime.now(UTC)
+        now = self._now()
 
         if act == "":
             return self.panel(cid, toast="🔄 تم التحديث" if len(parts) > 1 else None)
@@ -400,10 +462,22 @@ class Alarm:
             self.send_test(cid, now)
             return Reply(toast="🧪 أرسلت لك تنبيهًا تجريبيًا")
         if act == "ok":
+            if arg is not None and len(parts) > 3 and parts[3] != "0":
+                # يُسجَّل أنه أنجز الموعد، فلا يصله التنبيه الأخير قبل الإغلاق
+                self.app.store.claim(self._ack_key(parts[3], self.events[int(arg)]["id"], cid),
+                                     now.timestamp())
             text = (ctx.message or {}).get("text") or ""
             return Reply(f"{text}\n\n✅ تمّ، بالتوفيق 🍀", None, toast="بالتوفيق 🍀")
         if act == "sz":
-            self.snooze(cid, int(arg), now)
+            ei, ev = int(arg), self.events[int(arg)]
+            start = None
+            if len(parts) <= 3 and ev["dur"]:  # تنبيه حقيقي (وليس تجريبيًا)
+                start = self.open_window(ev, now)
+                if not start:
+                    return Reply(toast=f"⌛ انتهى وقت {ev['name']} لهذا اليوم.", alert=True)
+                if now + timedelta(minutes=self.snooze_minutes) >= start + ev["dur"]:
+                    return Reply(toast=f"⏳ {ev['name']} يُغلق قبل ذلك، أنجزه الآن!", alert=True)
+            self.snooze(cid, ei, now, start)
             later = f"😴 سأذكّرك بعد {minutes_label(self.snooze_minutes)}"
             text = (ctx.message or {}).get("text") or ""
             return Reply(f"{text}\n\n{later}", None, toast=later)
@@ -414,16 +488,18 @@ class Alarm:
         sub = self.app.store.get_sub(chat_id) or self._defaults()
         ei, ev = next(((i, e) for i, e in enumerate(self.events) if e["id"] in sub.get("ev", [])),
                       (0, self.events[0]))
-        target = next(t for t in self._occurrences(ev, now, 0, 8) if t > now)
+        start = self.open_window(ev, now) or next(
+            t for t in self._occurrences(ev, now, 0, 8) if t > now)
         self.app.api.call("sendMessage", chat_id=chat_id,
-                          text="🧪 تنبيه تجريبي، هكذا سيصلك:\n\n" + self.main_text(sub, ev, target),
-                          reply_markup=self.alert_buttons(ei))
+                          text="🧪 تنبيه تجريبي، هكذا سيصلك:\n\n"
+                               + self.main_text(sub, ev, start, max(now, start)),
+                          reply_markup=self.alert_buttons(ei, None, test=True))
 
-    def snooze(self, chat_id, ei: int, now: datetime | None = None):
+    def snooze(self, chat_id, ei: int, now: datetime | None = None, start=None):
         self.events[ei]  # يتأكد أن الرقم صحيح
         due = (now or datetime.now(UTC)) + timedelta(minutes=self.snooze_minutes)
         with self._lock:
-            self._snoozes.append((due, chat_id, ei))
+            self._snoozes.append((due, chat_id, ei, start))
 
     # ------------------------------------------------------------ scheduler
 
@@ -435,29 +511,53 @@ class Alarm:
         active = {cid: s for cid, s in store.subs().items()
                   if s.get("on") and (s.get("pause") or 0) <= now.timestamp()}
         leads = {0} | {int(s.get("lead") or 0) for s in active.values()}
+
+        def wants(s, ev):
+            return ev["id"] in (s.get("ev") or [])
+
         for ei, ev in enumerate(self.events):
-            for target in self._occurrences(ev, now):
+            # التنبيه الأساسي يُرسل حتى لو تأخر السيرفر ما دام الموعد مفتوحًا،
+            # إلى أن يحين التنبيه الأخير (فيغني عنه) أو قبل الإغلاق بـ5 دقائق
+            tail = timedelta(minutes=self.closing or 5)
+            main_limit = ev["dur"] - tail if ev["dur"] > max(GRACE, tail) else GRACE
+            for start in self._occurrences(ev, now):
+                day = f"{start:%Y-%m-%d}"
                 for lead in sorted(leads):
-                    fire_at = target - timedelta(minutes=lead)
-                    if not fire_at <= now < fire_at + GRACE:
+                    if lead == 0:
+                        if not start <= now < start + main_limit:
+                            continue
+                    else:
+                        fire_at = start - timedelta(minutes=lead)
+                        if not fire_at <= now < fire_at + GRACE or start - now < timedelta(minutes=1):
+                            continue  # فات وقت التذكير المسبق، سيصله التنبيه الأساسي
+                    if not store.claim(f"{day}|{ev['id']}|{lead}", now.timestamp()):
                         continue
-                    if lead and target - now < timedelta(minutes=1):
-                        continue  # فات وقت التذكير المسبق، سيصله التنبيه الأساسي
-                    if not store.claim(f"{target:%Y-%m-%d}|{ev['id']}|{lead}", now.timestamp()):
-                        continue
-                    ids = [cid for cid, s in active.items() if ev["id"] in (s.get("ev") or [])
+                    ids = [cid for cid, s in active.items() if wants(s, ev)
                            and (lead == 0 or int(s.get("lead") or 0) == lead)]
                     if ids:
-                        self.app.run(partial(self._deliver, ids, ei, target, lead, now))
+                        self.app.run(partial(self._deliver, ids, ei, start,
+                                             "pre" if lead else "main", now))
+
+                # تنبيه أخير قبل الإغلاق لمن لم يضغط «تمّ»
+                end = start + ev["dur"]
+                if self.closing and ev["dur"] > timedelta(minutes=self.closing):
+                    fire_at = end - timedelta(minutes=self.closing)
+                    if (fire_at <= now < end - timedelta(minutes=1)
+                            and store.claim(f"{day}|{ev['id']}|close", now.timestamp())):
+                        ack_day = f"{start:%Y%m%d}"
+                        ids = [cid for cid, s in active.items() if wants(s, ev)
+                               and not store.has(self._ack_key(ack_day, ev["id"], cid))]
+                        if ids:
+                            self.app.run(partial(self._deliver, ids, ei, start, "close", now))
         with self._lock:
             due = [s for s in self._snoozes if s[0] <= now]
             self._snoozes = [s for s in self._snoozes if s[0] > now]
         if due:
-            self.app.run(partial(self._deliver_snoozes, due))
+            self.app.run(partial(self._deliver_snoozes, due, now))
         store.prune(now.timestamp() - 3 * 86400)
         store.flush()
 
-    def _deliver(self, ids, ei, target, lead, now):
+    def _deliver(self, ids, ei, start, kind, now):
         ev = self.events[ei]
         store = self.app.store
 
@@ -465,22 +565,27 @@ class Alarm:
             sub = store.get_sub(cid)
             if not sub or not sub.get("on"):
                 return None
-            if lead:
-                return "sendMessage", {"text": self.pre_text(sub, ev, target, now)}
-            return "sendMessage", {"text": self.main_text(sub, ev, target),
-                                   "reply_markup": self.alert_buttons(ei)}
+            if kind == "pre":
+                return "sendMessage", {"text": self.pre_text(sub, ev, start, now)}
+            if kind == "close":
+                return "sendMessage", {"text": self.closing_text(sub, ev, start, now),
+                                       "reply_markup": self.alert_buttons(ei, start, snooze=False)}
+            return "sendMessage", {"text": self.main_text(sub, ev, start, now),
+                                   "reply_markup": self.alert_buttons(ei, start)}
 
         ok, failed = send_many(self.app.api, ids, make, on_blocked=self.mark_blocked)
-        print(f"alarm {ev['id']} {target:%Y-%m-%d %H:%M} lead={lead}: sent {ok}, failed {failed}",
+        print(f"alarm {ev['id']} {start:%Y-%m-%d %H:%M} {kind}: sent {ok}, failed {failed}",
               flush=True)
 
-    def _deliver_snoozes(self, due):
-        for _, cid, ei in due:
+    def _deliver_snoozes(self, due, now):
+        for _, cid, ei, start in due:
+            ev = self.events[ei]
             sub = self.app.store.get_sub(cid) or self._defaults()
+            text = self.snooze_text(sub, ev, start, now) if start else (
+                f"🔔 تذكير: {ev.get('emoji', '')} {ev['name']}\n\nطلبت مني أذكّرك مرة ثانية، لا تنسَ! ⏰")
             try:
-                self.app.api.call("sendMessage", chat_id=cid,
-                                  text=self.snooze_text(sub, self.events[ei]),
-                                  reply_markup=self.alert_buttons(ei, snooze=False))
+                self.app.api.call("sendMessage", chat_id=cid, text=text,
+                                  reply_markup=self.alert_buttons(ei, start, snooze=False))
             except TelegramError as e:
                 print("snooze send failed:", e, flush=True)
 

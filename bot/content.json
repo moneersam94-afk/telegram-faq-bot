@@ -43,6 +43,7 @@
         "button": "الصفقة",
         "emoji": "📈",
         "time_gmt": "15:30",
+        "duration_minutes": 120,
         "pre_message": "جهّز نفسك وكن جاهزًا قبل الموعد 💪",
         "message": "لا تفوّت الموعد. بالتوفيق 🍀"
       },
@@ -52,6 +53,7 @@
         "button": "الأرباح",
         "emoji": "💰",
         "time_gmt": "18:30",
+        "duration_minutes": 120,
         "pre_message": "اقترب وقت جمع الأرباح، تجهّز 💪",
         "message": "لا تنسَ جمع أرباحك في وقتها ✨"
       }
@@ -59,6 +61,7 @@
     "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
     "default_lead_minutes": 10,
     "lead_options": [0, 5, 10, 15, 30, 60],
-    "snooze_minutes": 5
+    "snooze_minutes": 5,
+    "closing_reminder_minutes": 15
   }
 }

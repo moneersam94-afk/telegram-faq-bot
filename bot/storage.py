@@ -161,6 +161,10 @@ class Store:
             self._dirty = True
             return True
 
+    def has(self, key: str) -> bool:
+        with self.lock:
+            return key in self.data["fired"]
+
     def prune(self, before_ts: float):
         with self.lock:
             old = [k for k, t in self.data["fired"].items() if t < before_ts]
