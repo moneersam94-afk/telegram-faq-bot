@@ -223,6 +223,7 @@ def show_topic(ctx: Ctx, i: int) -> Reply:
     single = len(videos) == 1 and len(text) <= 1024  # حد وصف الفيديو في تلجرام
     if not single:
         ctx.send(text)
+    failed, last_ok = [], True
     for n, src in enumerate(videos):
         last = n == len(videos) - 1
         method, params = media_call(src)
@@ -235,8 +236,16 @@ def show_topic(ctx: Ctx, i: int) -> Reply:
             ctx.api.call(method, chat_id=ctx.chat_id, **params)
         except TelegramError as e:
             print(f"explain media failed ({src}): {e}", flush=True)
-            if last:
-                ctx.send((text + "\n\n" if single else "") + "⚠️ تعذّر عرض الفيديو حاليًا.", markup)
+            failed.append(src)
+            last_ok = not last
+    if failed:
+        # احتياط: زر يفتح المنشور في القناة مباشرة حتى لا يبقى الشرح فارغًا
+        links = [s if s.startswith("http") else "https://" + s for s in failed if _POST_LINK.match(s)]
+        rows = [[url_btn("▶️ مشاهدة الشرح في القناة", u)] for u in links]
+        if not last_ok:
+            rows += markup["inline_keyboard"]
+        note = ("تقدر تشاهده من القناة مباشرة 👇" if links else "حاول مرة أخرى لاحقًا.")
+        ctx.send((text + "\n\n" if single else "") + f"⚠️ تعذّر عرض الفيديو هنا. {note}", kb(rows))
     return Reply(toast="🎬 تفضّل الشرح")
 
 
@@ -428,13 +437,17 @@ def _on_callback(cq: dict, app: App) -> None:
 
 
 def _on_member(upd: dict, app: App) -> None:
-    """عند إضافة البوت مشرفًا في قناة، يكتب فيها معرّفها (مفيد لقناة الفيديوهات)."""
+    """عند إضافة البوت مشرفًا في قناة، يُبلغ المدراء في الخاص (ولا يكتب شيئًا في القناة)."""
     chat = upd.get("chat") or {}
     status = (upd.get("new_chat_member") or {}).get("status")
     if chat.get("type") == "channel" and status == "administrator":
-        try:
-            app.api.call("sendMessage", chat_id=chat["id"],
-                         text=f"✅ تم ربط البوت بهذه القناة.\n🆔 معرف القناة: {chat['id']}\n\n"
-                              "يمكنك حذف هذه الرسالة.")
-        except TelegramError:
-            pass
+        name = chat.get("title", "")
+        if chat.get("username"):
+            name += f" (@{chat['username']})"
+        for admin_id in app.admins:
+            try:
+                app.api.call("sendMessage", chat_id=admin_id,
+                             text=f"✅ تمت إضافتي مشرفًا في القناة: {name}\n🆔 معرّفها: {chat['id']}\n\n"
+                                  "صار بإمكاني عرض منشوراتها في الشروحات.")
+            except TelegramError:
+                pass
