@@ -46,6 +46,11 @@ class FakeAPI:
             return self.chat
         if method == "getFile":
             return {"file_path": "docs/1.json"}
+        if method == "getChatMember":
+            return {"status": "administrator", "can_pin_messages": True,
+                    "can_delete_messages": True}
+        if method in ("deleteMessage", "pinChatMessage", "unpinChatMessage", "leaveChat"):
+            return True
         self._id += 1
         return {"message_id": self._id}
 
@@ -67,7 +72,20 @@ class FakeAPI:
 def make_app(content=None):
     store = Store()
     store.load()
-    return App(FakeAPI(), content or copy.deepcopy(CONTENT), store, [ADMIN], run=lambda f: f())
+    app = App(FakeAPI(), content or copy.deepcopy(CONTENT), store, [ADMIN], run=lambda f: f())
+    app.me = {"id": 999, "username": "Wealth_Excel_bot"}
+    return app
+
+
+GROUP = -100500
+
+
+def added_to_group(by, status="administrator", pin=True, delete=True):
+    return {"update_id": 11, "my_chat_member": {
+        "chat": {"id": GROUP, "type": "supergroup", "title": "قروب التداول"},
+        "from": {"id": by, "first_name": "سامي", "username": "sami"},
+        "new_chat_member": {"status": status, "can_pin_messages": pin,
+                            "can_delete_messages": delete}}}
 
 
 def msg(text=None, chat_type="private", uid=42, **extra):
@@ -133,8 +151,18 @@ class TestMenus(unittest.TestCase):
         self.assertIn("أحمد", sent["text"])
         self.assertIn("ويلث إكسل", sent["text"])
         self.assertEqual([b["callback_data"] for b in buttons(sent["reply_markup"])],
-                         ["e", "f", "r", "a"])
-        self.assertIn("تفعيل", buttons(sent["reply_markup"])[3]["text"])
+                         ["a", "e", "f", "acc", "r"])
+        self.assertIn("تفعيل", buttons(sent["reply_markup"])[0]["text"])
+        self.assertNotIn("غير رسمي", sent["text"])
+
+    def test_accounts_page(self):
+        app = make_app()
+        handle_update(cb("acc"), app)
+        edit = app.api.last("editMessageText")
+        self.assertIn("هذه هي الحسابات الرسمية", edit["text"])
+        urls = [b.get("url") for b in buttons(edit["reply_markup"])]
+        self.assertIn("https://t.me/wealthexcel_global", urls)
+        self.assertIn("https://t.me/Maestro199411", urls)
 
     def test_ignores_groups(self):
         app = make_app()
@@ -265,7 +293,7 @@ class TestAlarmSettings(unittest.TestCase):
         self.assertIn("6:30 م – 8:30 م بتوقيتك", panel)  # 15:30 GMT = 6:30 م السعودية، لساعتين
         self.assertIn("9:30 م – 11:30 م بتوقيتك", panel)
         handle_update(msg("/start"), self.app)
-        self.assertIn("مفعّل", buttons(self.app.api.last("sendMessage")["reply_markup"])[3]["text"])
+        self.assertIn("مفعّل", buttons(self.app.api.last("sendMessage")["reply_markup"])[0]["text"])
 
     def test_settings(self):
         handle_update(cb("a:tz:0:1"), self.app)
@@ -459,6 +487,158 @@ class TestAdmin(unittest.TestCase):
         self.assertEqual(sent["chat_id"], ADMIN)  # لا شيء يُكتب في القناة نفسها
         self.assertIn("-100777", sent["text"])
         self.assertEqual(len(self.app.api.of("sendMessage")), 1)
+
+
+class TestGroups(unittest.TestCase):
+    T0 = datetime(2026, 11, 24, 15, 30, tzinfo=UTC)
+
+    def setUp(self):
+        self.app = make_app()
+        self.api = self.app.api
+
+    def group_msgs(self):
+        return [p for p in self.api.of("sendMessage") if p["chat_id"] == GROUP]
+
+    def test_only_admin_can_register_group(self):
+        handle_update(added_to_group(by=42), self.app)
+        self.assertEqual(self.api.last("leaveChat")["chat_id"], GROUP)
+        self.assertIsNone(self.app.store.get_group(GROUP))
+        self.assertIn("فخرجت منه", self.api.last("sendMessage")["text"])
+
+        handle_update(added_to_group(by=ADMIN, status="member"), self.app)
+        self.assertTrue(self.app.store.get_group(GROUP)["on"])
+        note = self.api.last("sendMessage")
+        self.assertEqual(note["chat_id"], ADMIN)
+        self.assertIn("تم تسجيل القروب", note["text"])
+        self.assertIn("اجعلني مشرفًا", note["text"])
+
+    def test_daily_cycle_post_pin_cleanup_unpin(self):
+        handle_update(added_to_group(by=ADMIN), self.app)
+        self.app.alarm.tick(self.T0)
+        opened = self.group_msgs()[-1]
+        self.assertIn("بدأ موعد الصفقة الآن", opened["text"])
+        self.assertIn("من 3:30 م حتى 5:30 م بتوقيت غرينتش", opened["text"])
+        self.assertTrue(any(p in opened["text"] for p in
+                            CONTENT["alarm"]["events"][0]["group_open"]))
+        self.assertIn("start=alarm", json.dumps(opened["reply_markup"]))
+        first_id = self.app.store.get_group(GROUP)["last"]
+        self.assertEqual(self.api.last("pinChatMessage")["message_id"], first_id)
+        self.assertTrue(self.api.last("pinChatMessage")["disable_notification"])
+
+        self.app.alarm.tick(self.T0 + timedelta(minutes=105))  # قبل الإغلاق بربع ساعة
+        closing = self.group_msgs()[-1]
+        self.assertIn("تنبيه أخير", closing["text"])
+        self.assertEqual(self.api.last("deleteMessage")["message_id"], first_id)
+
+        self.app.alarm.tick(self.T0 + timedelta(minutes=120))  # أُغلق الموعد
+        self.assertEqual(self.api.last("unpinChatMessage")["message_id"],
+                         self.app.store.get_group(GROUP)["last"])
+        n = len(self.group_msgs())
+        self.app.alarm.tick(self.T0 + timedelta(minutes=121))
+        self.assertEqual(len(self.group_msgs()), n)  # بدون تكرار
+
+    def test_missing_rights_warns_admin_once(self):
+        handle_update(added_to_group(by=ADMIN), self.app)
+
+        def no_pin(p):
+            raise TelegramError("pinChatMessage", "Bad Request: not enough rights")
+        self.api.fail["pinChatMessage"] = no_pin
+        self.app.alarm.tick(self.T0)
+        self.app.alarm.tick(self.T0 + timedelta(minutes=105))
+        warns = [p for p in self.api.of("sendMessage")
+                 if p["chat_id"] == ADMIN and "صلاحية تثبيت" in p["text"]]
+        self.assertEqual(len(warns), 1)
+
+    def test_kicked_bot_removes_group(self):
+        handle_update(added_to_group(by=ADMIN), self.app)
+
+        def kicked(p):
+            if p["chat_id"] == GROUP:
+                raise TelegramError("sendMessage", "Forbidden: bot was kicked", 403)
+        self.api.fail["sendMessage"] = kicked
+        self.app.alarm.tick(self.T0)
+        self.assertIsNone(self.app.store.get_group(GROUP))
+
+    def test_groups_admin_menu(self):
+        handle_update(added_to_group(by=ADMIN), self.app)
+        handle_update(msg("/groups", uid=ADMIN), self.app)
+        self.assertIn("قروب التداول", self.api.last("sendMessage")["text"])
+        handle_update(cb(f"gr:{GROUP}", uid=ADMIN), self.app)
+        self.assertIn("📌 التثبيت: ✅", self.api.last("editMessageText")["text"])
+        handle_update(cb(f"gr:{GROUP}:t", uid=ADMIN), self.app)
+        self.assertFalse(self.app.store.get_group(GROUP)["on"])
+        n = len(self.group_msgs())
+        self.app.alarm.tick(self.T0)  # القروب متوقف
+        self.assertEqual(len(self.group_msgs()), n)
+        handle_update(cb(f"gr:{GROUP}:x", uid=ADMIN), self.app)
+        self.assertIn("رسالة تجريبية", self.group_msgs()[-1]["text"])
+        handle_update(cb(f"gr:{GROUP}:rmy", uid=ADMIN), self.app)
+        self.assertIsNone(self.app.store.get_group(GROUP))
+        handle_update(cb("gr", uid=42), self.app)  # غير المدير
+        self.assertIn("لم يعد متاحًا", self.api.last("editMessageText")["text"])
+
+    def test_broadcast_to_groups(self):
+        handle_update(added_to_group(by=ADMIN), self.app)
+        handle_update(msg("مرحبا"), self.app)
+        handle_update(msg("/broadcast", uid=ADMIN, reply_to_message={"message_id": 77}), self.app)
+        self.assertIn("ad:bc:77:g", json.dumps(self.api.last("sendMessage")))
+        handle_update(cb("ad:bc:77:g", uid=ADMIN), self.app)
+        self.assertEqual({p["chat_id"] for p in self.api.of("copyMessage")}, {GROUP})
+        handle_update(cb("ad:bc:77:x", uid=ADMIN), self.app)
+        self.assertEqual({p["chat_id"] for p in self.api.of("copyMessage")}, {GROUP, 42, ADMIN})
+
+
+class TestPrivateMessages(unittest.TestCase):
+    def setUp(self):
+        self.app = make_app()
+        self.api = self.app.api
+        handle_update(msg("مرحبا"), self.app)  # المستخدم 42 (أحمد) بدأ البوت
+
+    def test_user_saved_with_name(self):
+        m = msg("hi")
+        m["message"]["from"]["username"] = "ahmad_x"
+        handle_update(m, self.app)
+        self.assertEqual(self.app.store.get_user(42)["u"], "ahmad_x")
+        self.assertEqual(self.app.store.find_users("AHMAD_X")[0][0], 42)
+        self.assertEqual(self.app.store.find_users("أحمد")[0][0], 42)
+
+    def test_send_flow_and_reply(self):
+        handle_update(msg("/send 42", uid=ADMIN), self.app)
+        self.assertIn("أرسل الآن الرسالة", self.api.last("sendMessage")["text"])
+        handle_update(msg("مرحبا أحمد، كيف أقدر أساعدك؟", uid=ADMIN), self.app)
+        self.assertIn("ad:sd:5:42", json.dumps(self.api.last("sendMessage")))
+        handle_update(cb("ad:sd:5:42", uid=ADMIN), self.app)
+        copied = self.api.last("copyMessage")
+        self.assertEqual((copied["chat_id"], copied["from_chat_id"]), (42, ADMIN))
+        self.assertIn('"rp"', json.dumps(copied["reply_markup"]))
+        self.assertIn("تم إرسال", self.api.last("editMessageText")["text"])
+
+        handle_update(cb("rp"), self.app)  # المستخدم يضغط «الرد على الإدارة»
+        self.assertIn("اكتب ردك", self.api.last("sendMessage")["text"])
+        handle_update(msg("شكرًا، عندي سؤال"), self.app)
+        to_admin = [p for p in self.api.of("sendMessage") if p["chat_id"] == ADMIN][-1]
+        self.assertIn("رد من أحمد", to_admin["text"])
+        self.assertIn("ad:sn:42", json.dumps(to_admin["reply_markup"]))
+        self.assertEqual(self.api.last("copyMessage")["chat_id"], ADMIN)
+        self.assertIn("وصل ردك", self.api.last("sendMessage")["text"])
+        handle_update(msg("سؤال عادي"), self.app)  # بعدها يرجع البوت لعمله العادي
+        self.assertEqual(len([p for p in self.api.of("copyMessage") if p["chat_id"] == ADMIN]), 1)
+
+    def test_cancel_and_unknown_user(self):
+        handle_update(msg("/send @nobody", uid=ADMIN), self.app)
+        self.assertIn("لم أجد", self.api.last("sendMessage")["text"])
+        handle_update(msg("/send 42", uid=ADMIN), self.app)
+        handle_update(msg("/cancel", uid=ADMIN), self.app)
+        self.assertIn("تم الإلغاء", self.api.last("sendMessage")["text"])
+        self.assertNotIn(ADMIN, self.app.pending)
+
+    def test_user_search(self):
+        handle_update(msg("/user أحمد", uid=ADMIN), self.app)
+        self.assertIn("ad:us:42", json.dumps(self.api.last("sendMessage")))
+        handle_update(cb("ad:us:42", uid=ADMIN), self.app)
+        self.assertIn("🆔 42", self.api.last("editMessageText")["text"])
+        handle_update(msg("/send 42", uid=42), self.app)  # غير المدير لا يملك الأمر
+        self.assertNotIn(42, self.app.pending)
 
 
 if __name__ == "__main__":
