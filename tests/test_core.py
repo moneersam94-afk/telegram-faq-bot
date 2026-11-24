@@ -3,6 +3,7 @@
 import copy
 import json
 import sys
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -74,6 +75,7 @@ def make_app(content=None):
     store.load()
     app = App(FakeAPI(), content or copy.deepcopy(CONTENT), store, [ADMIN], run=lambda f: f())
     app.me = {"id": 999, "username": "Wealth_Excel_bot"}
+    app.groups.welcome.delay = 0  # الترحيب فورًا في الاختبارات
     return app
 
 
@@ -291,7 +293,7 @@ class TestAlarmSettings(unittest.TestCase):
         self.assertIn("تفعيل", self.app.api.last("answerCallbackQuery")["text"])
         panel = self.app.api.last("editMessageText")["text"]
         self.assertIn("6:30 م – 8:30 م بتوقيتك", panel)  # 15:30 GMT = 6:30 م السعودية، لساعتين
-        self.assertIn("9:30 م – 11:30 م بتوقيتك", panel)
+        self.assertIn("9:30 م – 12:30 ص بتوقيتك", panel)  # الأرباح 3 ساعات
         handle_update(msg("/start"), self.app)
         self.assertIn("مفعّل", buttons(self.app.api.last("sendMessage")["reply_markup"])[0]["text"])
 
@@ -548,7 +550,9 @@ class TestGroups(unittest.TestCase):
         self.app.alarm.tick(self.T0 + timedelta(minutes=180))  # فتح جمع الأرباح
         self.assertIn("بدأ موعد جمع الأرباح", self.group_msgs()[-1]["text"])
         self.assertEqual(self.api.last("deleteMessage")["message_id"], end_id)
-        self.app.alarm.tick(self.T0 + timedelta(minutes=300))  # إغلاق الأرباح
+        self.app.alarm.tick(self.T0 + timedelta(minutes=345))  # التنبيه الأخير 9:15 م
+        self.assertIn("الإغلاق الساعة 9:30 م", self.group_msgs()[-1]["text"])
+        self.app.alarm.tick(self.T0 + timedelta(minutes=360))  # إغلاق الأرباح 9:30 م
         self.assertIn("نلقاكم بكرة الساعة 3:30 م", self.group_msgs()[-1]["text"])
 
     def test_missing_rights_warns_admin_once(self):
@@ -600,6 +604,83 @@ class TestGroups(unittest.TestCase):
         self.assertEqual({p["chat_id"] for p in self.api.of("copyMessage")}, {GROUP})
         handle_update(cb("ad:bc:77:x", uid=ADMIN), self.app)
         self.assertEqual({p["chat_id"] for p in self.api.of("copyMessage")}, {GROUP, 42, ADMIN})
+
+
+class TestWelcome(unittest.TestCase):
+    def setUp(self):
+        self.app = make_app()
+        self.api = self.app.api
+        handle_update(added_to_group(by=ADMIN), self.app)
+
+    def joined(self, *users):
+        return {"update_id": 20, "message": {
+            "message_id": 300, "chat": {"id": GROUP, "type": "supergroup", "title": "قروب التداول"},
+            "new_chat_members": [{"id": uid, "first_name": name, "is_bot": False}
+                                 for uid, name in users]}}
+
+    def welcomes(self):
+        return [p for p in self.api.of("sendMessage")
+                if p["chat_id"] == GROUP and p.get("parse_mode") == "HTML"]
+
+    def test_welcome_with_mention_and_button(self):
+        handle_update(self.joined((77, "خالد")), self.app)
+        w = self.welcomes()[-1]
+        self.assertIn('<a href="tg://user?id=77">خالد</a>', w["text"])
+        self.assertIn("قروب التداول", w["text"])
+        self.assertIn("start=welcome", json.dumps(w["reply_markup"]))
+        self.assertIn("معلومات أكثر", json.dumps(w["reply_markup"], ensure_ascii=False))
+
+    def test_many_join_together_one_message(self):
+        handle_update(self.joined((1, "أحمد"), (2, "سارة"), (3, "خالد"), (4, "منى"), (5, "علي")),
+                      self.app)
+        self.assertEqual(len(self.welcomes()), 1)
+        self.assertIn("و3 آخرين", self.welcomes()[0]["text"])
+
+    def test_no_duplicate_from_chat_member_update(self):
+        handle_update(self.joined((77, "خالد")), self.app)
+        handle_update({"update_id": 21, "chat_member": {
+            "chat": {"id": GROUP, "type": "supergroup", "title": "قروب التداول"},
+            "old_chat_member": {"status": "left", "user": {"id": 77}},
+            "new_chat_member": {"status": "member",
+                                "user": {"id": 77, "first_name": "خالد", "is_bot": False}}}},
+            self.app)
+        self.assertEqual(len(self.welcomes()), 1)
+
+    def test_chat_member_join_when_join_messages_hidden(self):
+        handle_update({"update_id": 22, "chat_member": {
+            "chat": {"id": GROUP, "type": "supergroup", "title": "قروب التداول"},
+            "old_chat_member": {"status": "left", "user": {"id": 88}},
+            "new_chat_member": {"status": "member",
+                                "user": {"id": 88, "first_name": "منى", "is_bot": False}}}},
+            self.app)
+        self.assertIn("tg://user?id=88", self.welcomes()[-1]["text"])
+
+    def test_new_welcome_deletes_previous_and_expires_after_5_minutes(self):
+        handle_update(self.joined((77, "خالد")), self.app)
+        first = self.app.store.get_group(GROUP)["welcome_msg"]["id"]
+        handle_update(self.joined((78, "سارة")), self.app)
+        self.assertEqual(self.api.last("deleteMessage")["message_id"], first)
+        second = self.app.store.get_group(GROUP)["welcome_msg"]["id"]
+        n = len(self.api.of("deleteMessage"))
+        self.app.groups.welcome.tick(time.time() + 60)  # بعد دقيقة: يبقى
+        self.assertEqual(len(self.api.of("deleteMessage")), n)
+        self.app.groups.welcome.tick(time.time() + 301)  # بعد 5 دقائق: يُحذف
+        self.assertEqual(self.api.last("deleteMessage")["message_id"], second)
+        self.assertNotIn("welcome_msg", self.app.store.get_group(GROUP))
+
+    def test_ignores_bots_unregistered_groups_and_disabled(self):
+        handle_update({"update_id": 23, "message": {
+            "message_id": 301, "chat": {"id": GROUP, "type": "supergroup"},
+            "new_chat_members": [{"id": 5, "first_name": "Spam", "is_bot": True}]}}, self.app)
+        self.assertEqual(self.welcomes(), [])
+        other = self.joined((77, "خالد"))
+        other["message"]["chat"]["id"] = -100999  # قروب غير مسجل
+        handle_update(other, self.app)
+        self.assertEqual(self.welcomes(), [])
+        handle_update(cb(f"gr:{GROUP}:w", uid=ADMIN), self.app)  # إيقاف الترحيب
+        self.assertFalse(self.app.store.get_group(GROUP)["welcome"])
+        handle_update(self.joined((79, "علي")), self.app)
+        self.assertEqual(self.welcomes(), [])
 
 
 class TestPrivateMessages(unittest.TestCase):
