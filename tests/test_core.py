@@ -530,12 +530,26 @@ class TestGroups(unittest.TestCase):
         self.assertIn("تنبيه أخير", closing["text"])
         self.assertEqual(self.api.last("deleteMessage")["message_id"], first_id)
 
+        closing_id = self.app.store.get_group(GROUP)["last"]
+        pins = len(self.api.of("pinChatMessage"))
         self.app.alarm.tick(self.T0 + timedelta(minutes=120))  # أُغلق الموعد
-        self.assertEqual(self.api.last("unpinChatMessage")["message_id"],
-                         self.app.store.get_group(GROUP)["last"])
+        ended = self.group_msgs()[-1]
+        self.assertIn("🔒 انتهى موعد الصفقة لليوم", ended["text"])
+        self.assertIn("الموعد القادم: جمع الأرباح الساعة 6:30 م", ended["text"])
+        self.assertTrue(any(p in ended["text"] for p in
+                            CONTENT["alarm"]["events"][0]["group_end"]))
+        self.assertEqual(self.api.last("deleteMessage")["message_id"], closing_id)
+        self.assertEqual(len(self.api.of("pinChatMessage")), pins)  # رسالة الإغلاق بلا تثبيت
         n = len(self.group_msgs())
         self.app.alarm.tick(self.T0 + timedelta(minutes=121))
         self.assertEqual(len(self.group_msgs()), n)  # بدون تكرار
+
+        end_id = self.app.store.get_group(GROUP)["last"]
+        self.app.alarm.tick(self.T0 + timedelta(minutes=180))  # فتح جمع الأرباح
+        self.assertIn("بدأ موعد جمع الأرباح", self.group_msgs()[-1]["text"])
+        self.assertEqual(self.api.last("deleteMessage")["message_id"], end_id)
+        self.app.alarm.tick(self.T0 + timedelta(minutes=300))  # إغلاق الأرباح
+        self.assertIn("نلقاكم بكرة الساعة 3:30 م", self.group_msgs()[-1]["text"])
 
     def test_missing_rights_warns_admin_once(self):
         handle_update(added_to_group(by=ADMIN), self.app)
