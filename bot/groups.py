@@ -1,4 +1,5 @@
 """تنبيهات المنبه في القروبات: التسجيل، النشر التلقائي (مع التثبيت وتنظيف الرسالة السابقة)،
+لكل موعد: رسالة عند الفتح، وتنبيه أخير قبل الإغلاق، ورسالة عند الإغلاق (غير مثبّتة)،
 وإدارة القروبات من المدير بالأمر /groups.
 
 يُسجَّل القروب فقط إذا أضاف البوتَ إليه أحدُ المدراء، وإلا يخرج البوت منه تلقائيًا.
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 
 from bot import telegram
-from bot.alarm import GRACE, clock, until_label
+from bot.alarm import GRACE, WEEKDAYS, clock, until_label
 from bot.telegram import TelegramError
 from bot.ui import Reply, btn, kb, url_btn
 
@@ -126,10 +127,40 @@ class Groups:
 
     # ---------------------------------------------------------------- texts
 
+    def next_start(self, after: datetime):
+        """أقرب موعد قادم (من أي نوع) بعد وقت معيّن: (الموعد، وقت بدايته)."""
+        best = None
+        for ev in self.alarm.events:
+            for t in self.alarm._occurrences(ev, after, 0, 8):
+                if t > after:
+                    if best is None or t < best[1]:
+                        best = (ev, t)
+                    break
+        return best
+
+    def _next_line(self, end: datetime) -> str:
+        nxt = self.next_start(end)
+        if not nxt:
+            return ""
+        ev, t = nxt
+        name = ev["name"].removeprefix("موعد ").strip()
+        days = (t.date() - end.date()).days
+        if days == 0:
+            return f"⏭ الموعد القادم: {name} الساعة {clock(t)} بتوقيت غرينتش"
+        if days == 1:
+            return f"⏭ نلقاكم بكرة الساعة {clock(t)} بتوقيت غرينتش"
+        return f"⏭ الموعد القادم: {name} يوم {WEEKDAYS[t.weekday()]} الساعة {clock(t)} بتوقيت غرينتش"
+
     def text(self, ev: dict, start: datetime, kind: str, now: datetime) -> str:
         end = start + ev["dur"]
         emoji = ev.get("emoji", "")
-        if kind == "close":
+        if kind == "end":
+            head = f"🔒 انتهى {ev['name']} لليوم"
+            nxt = self._next_line(end)
+            if nxt:
+                head += "\n" + nxt
+            phrases = ev.get("group_end") or []
+        elif kind == "close":
             head = (f"⏳ تنبيه أخير: {ev['name']} يُغلق {until_label(end - now)}!\n"
                     f"🕒 الإغلاق الساعة {clock(end)} بتوقيت غرينتش")
             phrases = ev.get("group_close") or []
@@ -167,7 +198,7 @@ class Groups:
                         self.app.run(partial(self.post, ei, start, "close", now))
                 if ev["dur"] and end <= now < end + GRACE and \
                         store.claim(f"{day}|{ev['id']}|g-end", ts):
-                    self.app.run(self.unpin_all)
+                    self.app.run(partial(self.post, ei, start, "end", now))
 
     def post(self, ei: int, start: datetime, kind: str, now: datetime):
         ev = self.alarm.events[ei]
@@ -188,12 +219,13 @@ class Groups:
                     self._warn(cid, f"لم أستطع نشر التنبيه ({e.description}).")
                 continue
             sent += 1
-            self._replace_pinned(cid, g, msg["message_id"])
+            # رسالة الإغلاق لا تُثبَّت: التثبيت فقط لموعد مفتوح الآن
+            self._replace_pinned(cid, g, msg["message_id"], pin=kind != "end")
             time.sleep(telegram.SEND_DELAY)
         print(f"groups {ev['id']} {kind}: sent {sent}", flush=True)
 
-    def _replace_pinned(self, cid: int, g: dict, new_id: int):
-        """يحذف التنبيه السابق للبوت ويثبّت الجديد بدون إشعار إضافي للأعضاء."""
+    def _replace_pinned(self, cid: int, g: dict, new_id: int, pin: bool = True):
+        """يحذف التنبيه السابق للبوت (فقط رسالة البوت نفسه)، ويثبّت الجديد بدون إشعار إضافي."""
         api, problems = self.app.api, []
         if g.get("last"):
             try:
@@ -201,23 +233,20 @@ class Groups:
             except TelegramError as e:
                 if "not found" not in e.description:
                     problems.append("لا أملك صلاحية حذف الرسائل")
-        try:
-            api.call("pinChatMessage", chat_id=cid, message_id=new_id, disable_notification=True)
-        except TelegramError:
-            problems.append("لا أملك صلاحية تثبيت الرسائل")
+                    try:  # لم نستطع حذفها، فعلى الأقل نلغي تثبيتها
+                        api.call("unpinChatMessage", chat_id=cid, message_id=g["last"])
+                    except TelegramError:
+                        pass
+        if pin:
+            try:
+                api.call("pinChatMessage", chat_id=cid, message_id=new_id,
+                         disable_notification=True)
+            except TelegramError:
+                problems.append("لا أملك صلاحية تثبيت الرسائل")
         fresh = self.store.get_group(cid) or g
         self.store.set_group(cid, {**fresh, "last": new_id})
         if problems:
             self._warn(cid, "، و".join(problems) + ". اجعلني مشرفًا بهاتين الصلاحيتين.")
-
-    def unpin_all(self):
-        """عند إغلاق الموعد: إلغاء تثبيت آخر تنبيه (ويبقى في القروب حتى التنبيه القادم)."""
-        for cid, g in self.store.groups().items():
-            if g.get("last"):
-                try:
-                    self.app.api.call("unpinChatMessage", chat_id=cid, message_id=g["last"])
-                except TelegramError:
-                    pass
 
     # ------------------------------------------------------------- admin UI
 
