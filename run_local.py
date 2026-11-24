@@ -29,6 +29,7 @@ def main() -> None:
     store.load()
     app = App(api, load_content(), store, admins)
     me = api.call("getMe")
+    app.me = me
     print(f"متصل كبوت: @{me['username']}")
     if "--check" in sys.argv:
         return
