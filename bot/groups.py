@@ -16,6 +16,7 @@ from bot import telegram
 from bot.alarm import GRACE, WEEKDAYS, clock, until_label
 from bot.telegram import TelegramError
 from bot.ui import Reply, btn, kb, url_btn
+from bot.welcome import Welcome
 
 UTC = timezone.utc
 GROUP_TYPES = ("group", "supergroup")
@@ -40,6 +41,7 @@ def _yes(flag) -> str:
 class Groups:
     def __init__(self, app):
         self.app = app
+        self.welcome = Welcome(app)
 
     @property
     def alarm(self):
@@ -102,8 +104,20 @@ class Groups:
                           "وأحذف التنبيه السابق تلقائيًا."]
         self.notify_admins("\n".join(lines))
 
+    def on_chat_member(self, upd: dict):
+        """انضمام عضو للقروب (يصل للبوت لأنه مشرف، حتى لو كانت رسائل الانضمام مخفية)."""
+        old = (upd.get("old_chat_member") or {}).get("status")
+        new = upd.get("new_chat_member") or {}
+        joined = old in ("left", "kicked") and (
+            new.get("status") in ("member", "administrator")
+            or (new.get("status") == "restricted" and new.get("is_member", True)))
+        if joined and new.get("user"):
+            self.welcome.on_join(upd["chat"]["id"], [new["user"]])
+
     def on_group_message(self, msg: dict):
-        """تحويل القروب إلى سوبر قروب يغيّر معرّفه، فننقل بياناته للمعرّف الجديد."""
+        """رسائل القروب: الانضمام للترحيب، وتحويل القروب لسوبر قروب (يتغير معرّفه)."""
+        if msg.get("new_chat_members"):
+            self.welcome.on_join(msg["chat"]["id"], msg["new_chat_members"])
         new_id = msg.get("migrate_to_chat_id")
         old = self.store.get_group(msg["chat"]["id"])
         if new_id and old:
@@ -182,6 +196,7 @@ class Groups:
 
     def tick(self, now: datetime):
         store, alarm = self.store, self.alarm
+        self.welcome.tick(now.timestamp())
         if not any(g.get("on", True) for g in store.groups().values()):
             return
         ts = now.timestamp()
@@ -288,10 +303,13 @@ class Groups:
         on = g.get("on", True)
         lines = [f"💬 {g.get('title', '')}", "",
                  f"الحالة: {'🟢 التنبيهات مفعّلة' if on else '⏸ التنبيهات متوقفة'}",
+                 f"👋 الترحيب بالأعضاء الجدد: {_yes(g.get('welcome', True))}",
                  f"📌 التثبيت: {_yes(g.get('pin'))}", f"🗑 الحذف: {_yes(g.get('del'))}"]
         if g.get("warn"):
             lines += ["", f"⚠️ {g['warn']}"]
+        welcome = g.get("welcome", True)
         rows = [[btn("⏸ إيقاف التنبيهات" if on else "▶️ تفعيل التنبيهات", f"gr:{cid}:t")],
+                [btn("👋 إيقاف الترحيب" if welcome else "👋 تفعيل الترحيب", f"gr:{cid}:w")],
                 [btn("🧪 رسالة تجريبية", f"gr:{cid}:x")],
                 [btn("🚪 إخراج البوت من القروب", f"gr:{cid}:rm")],
                 [btn("⬅️ القروبات", "gr")]]
@@ -309,6 +327,9 @@ class Groups:
             return self.detail(cid)
         if act == "t":
             self.store.set_group(cid, {**g, "on": not g.get("on", True)})
+            return self.detail(cid, toast="✅ تم الحفظ")
+        if act == "w":
+            self.store.set_group(cid, {**g, "welcome": not g.get("welcome", True)})
             return self.detail(cid, toast="✅ تم الحفظ")
         if act == "x":
             ev = self.alarm.events[0]

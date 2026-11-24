@@ -18,7 +18,7 @@ from bot.telegram import TelegramAPI, TelegramError  # noqa: F401  (يُستور
 from bot.ui import Ctx, Reply, btn, home_row, kb, url_btn
 
 CONTENT_PATH = Path(__file__).with_name("content.json")
-ALLOWED_UPDATES = ["message", "callback_query", "my_chat_member"]
+ALLOWED_UPDATES = ["message", "callback_query", "my_chat_member", "chat_member"]
 
 
 # ------------------------------------------------------------------ content
@@ -340,6 +340,10 @@ def report_type(c: dict, i: int) -> Reply:
 def handle_update(update: dict, app: App) -> None:
     if "callback_query" in update:
         _on_callback(update["callback_query"], app)
+    elif "chat_member" in update:
+        upd = update["chat_member"]
+        if (upd.get("chat") or {}).get("type") in GROUP_TYPES:
+            app.groups.on_chat_member(upd)
     elif "my_chat_member" in update:
         upd = update["my_chat_member"]
         if (upd.get("chat") or {}).get("type") in GROUP_TYPES:
