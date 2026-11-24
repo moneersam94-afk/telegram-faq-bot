@@ -70,12 +70,15 @@ def ensure_webhook() -> str:
     url = f"{base}/webhook"
     try:
         me = API.call("getMe")
+        if APP:
+            APP.me = me  # يوزر البوت لزر «فعّل المنبه» في القروبات
         info = API.call("getWebhookInfo")
         if info.get("url") != url or set(info.get("allowed_updates") or []) != set(ALLOWED_UPDATES):
             API.call("setWebhook", url=url, secret_token=SECRET, allowed_updates=ALLOWED_UPDATES)
         API.call("setMyCommands", commands=COMMANDS)
         return (f"✅ البوت @{me['username']} يعمل ومربوط على:\n{url}\n"
-                f"💾 التخزين: {storage_status()}\n👑 عدد المدراء: {len(ADMINS)}")
+                f"💾 التخزين: {storage_status()}\n👑 عدد المدراء: {len(ADMINS)}\n"
+                f"💬 القروبات: {len(STORE.groups())}")
     except TelegramError as e:
         return f"❌ خطأ من تلجرام: {e}"
 

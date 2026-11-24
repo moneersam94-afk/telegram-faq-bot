@@ -17,7 +17,7 @@ from bot.telegram import TelegramError
 FILE_NAME = "wealth_bot_state.json"
 CAPTION = ("🗄 نسخة بيانات البوت (مشتركو المنبه وإعداداتهم).\n"
            "تتحدث تلقائيًا. لا تحذف هذه الرسالة ولا تلغِ تثبيتها.")
-SECTIONS = ("subs", "users", "fired")
+SECTIONS = ("subs", "users", "fired", "groups")
 
 
 class Store:
@@ -142,15 +142,65 @@ class Store:
         with self.lock:
             return {int(k): dict(v) for k, v in self.data["subs"].items()}
 
-    def touch_user(self, chat_id):
+    def touch_user(self, chat_id, user: dict | None = None):
+        """يسجّل المستخدم (أول ظهور، واسمه ويوزره ليتمكن المدير من مراسلته)."""
         with self.lock:
-            if str(chat_id) not in self.data["users"]:
-                self.data["users"][str(chat_id)] = int(time.time())
+            cur = self.data["users"].get(str(chat_id))
+            info = dict(cur) if isinstance(cur, dict) else {
+                "t": cur if isinstance(cur, int) else int(time.time())}  # الصيغة القديمة: رقم فقط
+            if user:
+                name = f"{user.get('first_name') or ''} {user.get('last_name') or ''}".strip()
+                info.update(n=name, u=user.get("username") or "")
+            if info != cur:
+                self.data["users"][str(chat_id)] = info
                 self._dirty = True
 
     def user_ids(self) -> list[int]:
         with self.lock:
             return [int(k) for k in self.data["users"]]
+
+    def get_user(self, chat_id) -> dict | None:
+        with self.lock:
+            cur = self.data["users"].get(str(chat_id))
+            if cur is None:
+                return None
+            return dict(cur) if isinstance(cur, dict) else {"t": cur}
+
+    def find_users(self, query: str, limit: int = 10) -> list[tuple[int, dict]]:
+        """بحث بالاسم أو اليوزر (بدون حساسية لحالة الأحرف)."""
+        q = query.strip().lstrip("@").lower()
+        exact, partial = [], []
+        with self.lock:
+            for k, v in self.data["users"].items():
+                if not isinstance(v, dict):
+                    continue
+                user, name = (v.get("u") or "").lower(), (v.get("n") or "").lower()
+                if q and q == user:
+                    exact.append((int(k), dict(v)))
+                elif q and (q in user or q in name):
+                    partial.append((int(k), dict(v)))
+        return (exact + partial)[:limit]
+
+    # ---------------------------------------------------------------- groups
+
+    def get_group(self, chat_id) -> dict | None:
+        with self.lock:
+            g = self.data["groups"].get(str(chat_id))
+            return dict(g) if g else None
+
+    def set_group(self, chat_id, group: dict):
+        with self.lock:
+            self.data["groups"][str(chat_id)] = dict(group)
+            self._dirty = True
+
+    def del_group(self, chat_id):
+        with self.lock:
+            if self.data["groups"].pop(str(chat_id), None) is not None:
+                self._dirty = True
+
+    def groups(self) -> dict[int, dict]:
+        with self.lock:
+            return {int(k): dict(v) for k, v in self.data["groups"].items()}
 
     def claim(self, key: str, ts: float) -> bool:
         """يعلّم مهمة (تنبيه معيّن) كمنفّذة. يرجع False إذا نُفذت من قبل."""

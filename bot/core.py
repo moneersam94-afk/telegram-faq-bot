@@ -12,6 +12,7 @@ from pathlib import Path
 
 from bot import admin
 from bot.alarm import Alarm
+from bot.groups import GROUP_TYPES, Groups
 from bot.storage import Store
 from bot.telegram import TelegramAPI, TelegramError  # noqa: F401  (يُستورد من هنا أيضًا)
 from bot.ui import Ctx, Reply, btn, home_row, kb, url_btn
@@ -47,6 +48,14 @@ def load_content(path: Path = CONTENT_PATH) -> dict:
     for i, t in enumerate(c["report"].get("types") or []):
         if not t.get("title"):
             raise ValueError(f"content.json: نوع المشكلة رقم {i + 1} بلا title")
+    acc = c.get("accounts")
+    if acc is not None:
+        if not acc.get("title"):
+            raise ValueError("content.json: الحسابات المعتمدة بلا title")
+        for row in acc.get("buttons") or []:
+            for b in row:
+                if not b.get("text") or not b.get("url"):
+                    raise ValueError("content.json: زر في الحسابات المعتمدة ينقصه text أو url")
     Alarm.validate(c["alarm"])
     return c
 
@@ -58,7 +67,10 @@ class App:
         self.store = store if store is not None else Store()
         self.admins = {int(a) for a in admins}
         self.run = run or (lambda fn: threading.Thread(target=fn, daemon=True).start())
+        self.me: dict = {}       # بيانات البوت نفسه من getMe (اليوزر والمعرّف)
+        self.pending: dict = {}  # عمليات تنتظر رسالة: مدير يراسل مستخدمًا، أو مستخدم يرد
         self.alarm = Alarm(self)
+        self.groups = Groups(self)
 
 
 # ------------------------------------------------------- Arabic text matching
@@ -158,10 +170,19 @@ def main_menu(app: App, chat_id) -> dict:
     c = app.content
     alarm_label = ("⏰ منبه الصفقات اليومية (مفعّل ✅)" if app.alarm.is_on(chat_id)
                    else c["alarm"].get("button") or c["alarm"]["title"])
-    return kb([[btn(c["explanations"]["title"], "e")],
-               [btn(c["faq"]["title"], "f")],
-               [btn(c["report"]["title"], "r")],
-               [btn(alarm_label, "a")]])
+    second = [btn(c["report"]["title"], "r")]
+    if c.get("accounts"):
+        second.insert(0, btn(c["accounts"]["title"], "acc"))
+    return kb([[btn(alarm_label, "a")],
+               [btn(c["explanations"]["title"], "e"), btn(c["faq"]["title"], "f")],
+               second])
+
+
+def accounts_reply(c: dict) -> Reply:
+    acc = c["accounts"]
+    text = "\n\n".join(x for x in (acc["title"], acc.get("text"), acc.get("warning")) if x)
+    rows = [[url_btn(b["text"], b["url"]) for b in row] for row in acc.get("buttons") or []]
+    return Reply(text, kb(rows + [home_row()]))
 
 
 def home_reply(ctx: Ctx) -> Reply:
@@ -320,17 +341,44 @@ def handle_update(update: dict, app: App) -> None:
     if "callback_query" in update:
         _on_callback(update["callback_query"], app)
     elif "my_chat_member" in update:
-        _on_member(update["my_chat_member"], app)
-    elif (update.get("message") or {}).get("chat", {}).get("type") == "private":
-        _on_message(update["message"], app)  # يرد فقط في المحادثات الخاصة
+        upd = update["my_chat_member"]
+        if (upd.get("chat") or {}).get("type") in GROUP_TYPES:
+            app.groups.on_member(upd)
+        else:
+            _on_member(upd, app)
+    elif update.get("message"):
+        msg = update["message"]
+        chat_type = (msg.get("chat") or {}).get("type")
+        if chat_type == "private":
+            _on_message(msg, app)  # يرد على الأسئلة في المحادثات الخاصة فقط
+        elif chat_type in GROUP_TYPES:
+            app.groups.on_group_message(msg)
 
 
 def _on_message(msg: dict, app: App) -> None:
     ctx = Ctx(app, msg["chat"]["id"], msg.get("from"))
-    app.store.touch_user(ctx.chat_id)
+    app.store.touch_user(ctx.chat_id, msg.get("from"))
+    text = (msg.get("text") or "").strip()
+
+    state = app.pending.get(ctx.chat_id)
+    if text.split("@")[0].lower() == "/cancel":
+        app.pending.pop(ctx.chat_id, None)
+        ctx.send("✖️ تم الإلغاء." if state else "لا توجد عملية لإلغائها.",
+                 main_menu(app, ctx.chat_id))
+        return
+    if state:
+        if text.startswith("/"):
+            app.pending.pop(ctx.chat_id, None)  # أي أمر آخر يلغي العملية الجارية
+        else:
+            app.pending.pop(ctx.chat_id, None)
+            if state["act"] == "send" and ctx.is_admin:
+                admin.confirm_send(ctx, msg, state["to"])
+            elif state["act"] == "reply":
+                admin.forward_reply(ctx, msg)
+            return
+
     if ctx.is_admin and admin.on_media(ctx, msg):
         return
-    text = (msg.get("text") or "").strip()
     if not text:
         ctx.send("أستقبل الرسائل النصية فقط حاليًا. اختر من القائمة أو اكتب سؤالك 👇",
                  main_menu(app, ctx.chat_id))
@@ -405,6 +453,14 @@ def _route(ctx: Ctx, data: str) -> Reply:
         return answer_reply(c, int(parts[1]), int(parts[2]))
     if data in ("r", "h"):
         return report_menu(c)
+    if data == "acc" and c.get("accounts"):
+        return accounts_reply(c)
+    if head == "gr":
+        return ctx.app.groups.on_callback(ctx, parts)
+    if data == "rp":  # المستخدم يريد الرد على رسالة الإدارة
+        ctx.app.pending[ctx.chat_id] = {"act": "reply"}
+        ctx.send("✍️ اكتب ردك الآن (نص أو صورة أو فيديو) وسأوصله للإدارة.\nللإلغاء: /cancel")
+        return Reply(toast="✍️ اكتب ردك")
     if head == "r":
         return report_type(c, int(parts[1]))
     if head == "a":

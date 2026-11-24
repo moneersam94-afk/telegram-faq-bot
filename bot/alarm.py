@@ -222,6 +222,12 @@ class Alarm:
                     break
         return best
 
+    def main_limit(self, ev) -> timedelta:
+        """التنبيه الأساسي يُرسل حتى لو تأخر السيرفر ما دام الموعد مفتوحًا،
+        إلى أن يحين التنبيه الأخير (فيغني عنه) أو قبل الإغلاق بـ5 دقائق."""
+        tail = timedelta(minutes=self.closing or 5)
+        return ev["dur"] - tail if ev["dur"] > max(GRACE, tail) else GRACE
+
     def open_window(self, ev, now: datetime):
         """بداية الموعد إذا كان متاحًا الآن، وإلا None."""
         for t in self._occurrences(ev, now, before=1, after=0):
@@ -516,10 +522,7 @@ class Alarm:
             return ev["id"] in (s.get("ev") or [])
 
         for ei, ev in enumerate(self.events):
-            # التنبيه الأساسي يُرسل حتى لو تأخر السيرفر ما دام الموعد مفتوحًا،
-            # إلى أن يحين التنبيه الأخير (فيغني عنه) أو قبل الإغلاق بـ5 دقائق
-            tail = timedelta(minutes=self.closing or 5)
-            main_limit = ev["dur"] - tail if ev["dur"] > max(GRACE, tail) else GRACE
+            main_limit = self.main_limit(ev)
             for start in self._occurrences(ev, now):
                 day = f"{start:%Y-%m-%d}"
                 for lead in sorted(leads):
@@ -554,6 +557,9 @@ class Alarm:
             self._snoozes = [s for s in self._snoozes if s[0] > now]
         if due:
             self.app.run(partial(self._deliver_snoozes, due, now))
+        groups = getattr(self.app, "groups", None)
+        if groups:
+            groups.tick(now)
         store.prune(now.timestamp() - 3 * 86400)
         store.flush()
 
