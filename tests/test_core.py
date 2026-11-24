@@ -217,6 +217,17 @@ class TestExplanations(unittest.TestCase):
         self.assertEqual(doc["document"], "XYZ")
         self.assertIn("youtube", json.dumps(doc["reply_markup"]))
 
+    def test_failed_post_offers_channel_link(self):
+        def not_found(p):
+            raise TelegramError("copyMessage", "Bad Request: message to copy not found")
+        self.app.api.fail["copyMessage"] = not_found
+        handle_update(cb("e:1"), self.app)
+        sent = self.app.api.last("sendMessage")
+        self.assertIn("تعذّر", sent["text"])
+        urls = [b.get("url") for b in buttons(sent["reply_markup"])]
+        self.assertIn("https://t.me/c/123456/7", urls)
+        self.assertIn("e", [b.get("callback_data") for b in buttons(sent["reply_markup"])])
+
     def test_media_call_public_link(self):
         self.assertEqual(media_call("t.me/mychannel/5"),
                          ("copyMessage", {"from_chat_id": "@mychannel", "message_id": 5}))
@@ -440,11 +451,14 @@ class TestAdmin(unittest.TestCase):
         self.assertEqual(targets, {42, ADMIN})
         self.assertIn("انتهى الإرسال", self.app.api.last("sendMessage")["text"])
 
-    def test_channel_admin_announces_id(self):
+    def test_channel_admin_notifies_admin_privately(self):
         handle_update({"update_id": 9, "my_chat_member": {
-            "chat": {"id": -100777, "type": "channel"},
+            "chat": {"id": -100777, "type": "channel", "title": "قناة", "username": "chan"},
             "new_chat_member": {"status": "administrator"}}}, self.app)
-        self.assertIn("-100777", self.app.api.last("sendMessage")["text"])
+        sent = self.app.api.last("sendMessage")
+        self.assertEqual(sent["chat_id"], ADMIN)  # لا شيء يُكتب في القناة نفسها
+        self.assertIn("-100777", sent["text"])
+        self.assertEqual(len(self.app.api.of("sendMessage")), 1)
 
 
 if __name__ == "__main__":
